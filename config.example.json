@@ -1,0 +1,16 @@
+{
+  "_comment": "Synthetic example only. Run the installer to create a real private configuration.",
+  "synthetic_example": true,
+  "output_path": "~/Documents/AFUScaleReader/measurements.md",
+  "output_format": "md",
+  "store_id": "00000000-0000-4000-8000-000000000000",
+  "debug_logging": false,
+  "sex": "male",
+  "height_cm": 175,
+  "birth_date": "1990-01-01",
+  "device_name_prefix": "AFU-WL",
+  "settle_seconds": 2,
+  "deduplication_seconds": 120,
+  "connection_timeout_seconds": 8,
+  "retry_delay_seconds": 1
+}

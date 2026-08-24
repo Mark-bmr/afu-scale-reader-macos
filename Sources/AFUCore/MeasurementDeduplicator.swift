@@ -1,0 +1,193 @@
+import Foundation
+
+public struct StableMeasurement: Equatable, Sendable {
+    public let measuredAt: Date
+    public let weightKilograms: Double
+    public let impedanceRawCode: Int?
+    public let rawHex: String
+    public let deviceName: String
+
+    public init(
+        measuredAt: Date,
+        weightKilograms: Double,
+        impedanceRawCode: Int?,
+        rawHex: String,
+        deviceName: String
+    ) {
+        self.measuredAt = measuredAt
+        self.weightKilograms = weightKilograms
+        self.impedanceRawCode = impedanceRawCode
+        self.rawHex = rawHex
+        self.deviceName = deviceName
+    }
+
+    public var signature: MeasurementSignature {
+        MeasurementSignature(
+            measuredAt: measuredAt,
+            weightKilograms: weightKilograms,
+            impedanceRawCode: impedanceRawCode,
+            deviceName: deviceName
+        )
+    }
+}
+
+public struct MeasurementSignature: Codable, Equatable, Sendable {
+    public let measuredAt: Date
+    public let weightKilograms: Double
+    public let impedanceRawCode: Int?
+    public let deviceName: String
+
+    public init(
+        measuredAt: Date,
+        weightKilograms: Double,
+        impedanceRawCode: Int?,
+        deviceName: String
+    ) {
+        self.measuredAt = measuredAt
+        self.weightKilograms = weightKilograms
+        self.impedanceRawCode = impedanceRawCode
+        self.deviceName = deviceName
+    }
+}
+
+public struct MeasurementDeduplicator: Sendable {
+    public let window: TimeInterval
+    public let weightTolerance: Double
+
+    public init(window: TimeInterval = 120, weightTolerance: Double = 0.005) {
+        self.window = window
+        self.weightTolerance = weightTolerance
+    }
+
+    public func isDuplicate(
+        _ candidate: MeasurementSignature,
+        comparedWith previous: MeasurementSignature?
+    ) -> Bool {
+        guard let previous else { return false }
+        let elapsed = candidate.measuredAt.timeIntervalSince(previous.measuredAt)
+        guard elapsed >= 0, elapsed <= window else { return false }
+        guard candidate.impedanceRawCode == previous.impedanceRawCode else { return false }
+        return abs(candidate.weightKilograms - previous.weightKilograms) <= weightTolerance
+    }
+}
+
+public struct MeasurementSessionTracker: Sendable {
+    private enum State: Sendable {
+        case idle
+        case measuring
+        case emitted
+    }
+
+    private struct StableCandidate: Sendable {
+        var measurement: StableMeasurement
+        var matchingSamples: Int
+        let deadline: Date
+    }
+
+    public let settleInterval: TimeInterval
+    private let minimumMatchingSamples = 3
+    private let weightTolerance = 0.005
+    private var state: State = .idle
+    private var candidate: StableCandidate?
+
+    public init(settleInterval: TimeInterval = 2) {
+        self.settleInterval = max(settleInterval, 0)
+    }
+
+    public mutating func receive(
+        _ packet: AFUPacket,
+        at receivedAt: Date,
+        deviceName: String
+    ) -> StableMeasurement? {
+        if packet.weightKilograms < 1 {
+            let measurement = convergedCandidateMeasurement()
+            candidate = nil
+            state = .idle
+            return measurement
+        }
+
+        guard state != .emitted else { return nil }
+
+        guard packet.isStable else {
+            candidate = nil
+            if state == .idle {
+                state = .measuring
+            }
+            return nil
+        }
+
+        let isMatchingCandidate = candidate.map {
+            $0.measurement.deviceName == deviceName
+                && abs($0.measurement.weightKilograms - packet.weightKilograms) <= weightTolerance
+        } ?? false
+        let firstStableAt = isMatchingCandidate ? candidate?.measurement.measuredAt ?? receivedAt : receivedAt
+        let impedanceRawCode = packet.impedanceRawCode
+            ?? (isMatchingCandidate ? candidate?.measurement.impedanceRawCode : nil)
+        let stableMeasurement = StableMeasurement(
+            measuredAt: firstStableAt,
+            weightKilograms: packet.weightKilograms,
+            impedanceRawCode: impedanceRawCode,
+            rawHex: packet.rawHex,
+            deviceName: deviceName
+        )
+
+        if isMatchingCandidate, var candidate {
+            candidate.measurement = stableMeasurement
+            candidate.matchingSamples += 1
+            self.candidate = candidate
+        } else {
+            candidate = StableCandidate(
+                measurement: stableMeasurement,
+                matchingSamples: 1,
+                deadline: receivedAt.addingTimeInterval(settleInterval)
+            )
+        }
+        state = .measuring
+
+        guard let candidate, candidate.matchingSamples >= minimumMatchingSamples else {
+            return nil
+        }
+
+        if candidate.measurement.impedanceRawCode != nil || receivedAt >= candidate.deadline {
+            self.candidate = nil
+            state = .emitted
+            return candidate.measurement
+        }
+        return nil
+    }
+
+    public mutating func flushIfDue(at date: Date) -> StableMeasurement? {
+        guard state != .emitted,
+              let candidate,
+              candidate.matchingSamples >= minimumMatchingSamples,
+              date >= candidate.deadline
+        else {
+            return nil
+        }
+        self.candidate = nil
+        state = .emitted
+        return candidate.measurement
+    }
+
+    public mutating func disconnect(at _: Date) -> StableMeasurement? {
+        endSession()
+    }
+
+    public mutating func measurementCompleted(at _: Date) -> StableMeasurement? {
+        endSession()
+    }
+
+    private mutating func endSession() -> StableMeasurement? {
+        let measurement = convergedCandidateMeasurement()
+        candidate = nil
+        state = .idle
+        return measurement
+    }
+
+    private func convergedCandidateMeasurement() -> StableMeasurement? {
+        guard let candidate, candidate.matchingSamples >= minimumMatchingSamples else {
+            return nil
+        }
+        return candidate.measurement
+    }
+}

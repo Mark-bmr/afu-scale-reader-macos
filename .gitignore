@@ -1,0 +1,11 @@
+.build/
+.swiftpm/
+.DS_Store
+*.log
+config.json
+measurements.md
+measurements.json
+*.local.json
+*.backup
+*.bak
+*.tmp

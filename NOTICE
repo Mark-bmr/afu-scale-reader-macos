@@ -1,0 +1,10 @@
+AFU Scale Reader is an independent, community-maintained interoperability
+project. It is not affiliated with, authorized by, or endorsed by AFU,
+Welland, or any related manufacturer. Product and company names remain the
+property of their respective owners.
+
+The implementation uses publicly observable Bluetooth interoperability facts
+and independently implements the published CUN-BAE mathematical formula. The
+references used for protocol comparison and algorithm evaluation are listed in
+docs/body-composition-algorithm.md. No third-party source code is bundled and
+the Swift package has no third-party package dependencies.

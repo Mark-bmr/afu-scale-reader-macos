@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDisplayName</key>
+    <string>AFU Scale Reader</string>
+    <key>CFBundleExecutable</key>
+    <string>AFUReader</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.github.mark-bmr.afuscalereader</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>AFU Scale Reader</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>13.0</string>
+    <key>LSUIElement</key>
+    <true/>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>用于自动连接蚂蚁阿福体脂秤，并将稳定测量结果保存到你选择的本地 Markdown 或 JSON 文件。</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>用于读取蚂蚁阿福体脂秤广播的体重和原始阻抗数据。</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+</dict>
+</plist>
