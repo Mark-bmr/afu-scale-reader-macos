@@ -1,0 +1,89 @@
+# GitHub Actions ripgrep 依赖修复实现计划
+
+> **目标**：让 GitHub Actions 在全新的 macOS runner 上安装公开仓库检查脚本所需的 ripgrep，并完成隐私门禁、测试与 Release 构建。
+> **架构**：保留现有检查脚本和验证顺序，只在 CI 工作流的检出步骤后显式安装 runner 依赖。业务代码、配置格式、测量数据链路和本地安装流程均不改变。
+> **技术栈**：GitHub Actions YAML、Homebrew、ripgrep、Swift Package Manager
+
+---
+
+## 改动范围
+
+| 文件 | 改动类型 | 改动说明 | 影响面 |
+|------|----------|----------|--------|
+| `.github/workflows/ci.yml` | 修改 | 在源码检出后执行 `brew install ripgrep` | 仅影响 GitHub Actions runner 的准备阶段 |
+| `docs/plan_ci_ripgrep_dependency.mdc` | 新增 | 记录问题证据、最小修复与验证命令 | 不参与应用构建和运行 |
+
+## 数据链路
+
+```text
+GitHub push
+  → macOS runner
+  → actions/checkout
+  → Homebrew 安装 ripgrep
+  → scripts/check-public-repo.sh 扫描仓库
+  → swift test
+  → swift build -c release
+  → GitHub Actions 成功或失败结论
+```
+
+本次没有业务数据结构转换或持久化。失败发生在 runner 缺少 `rg` 可执行文件时，由 shell 非零退出码传递给 GitHub Actions；依赖安装后，现有门禁脚本继续负责输出具体检查错误。
+
+## Task 1：声明 CI 审计依赖
+
+**文件**：修改 `.github/workflows/ci.yml`，新增 `docs/plan_ci_ripgrep_dependency.mdc`
+
+1. 编写失败测试
+
+   ```bash
+   rg -q -F 'brew install ripgrep' .github/workflows/ci.yml
+   ```
+
+   当前工作流没有声明 ripgrep，命令应以非零状态退出。
+
+2. 运行测试，确认失败
+
+   ```bash
+   rg -q -F 'brew install ripgrep' .github/workflows/ci.yml
+   test "$?" -ne 0
+   ```
+
+3. 编写最小实现，使测试通过
+
+   ```yaml
+   - name: Install audit dependency
+     run: brew install ripgrep
+   ```
+
+   该步骤位于 `actions/checkout` 与 `Public repository gate` 之间，不改现有门禁、测试或构建命令。
+
+4. 运行测试，确认通过
+
+   ```bash
+   rg -q -F 'brew install ripgrep' .github/workflows/ci.yml
+   bash scripts/check-public-repo.sh
+   swift test --disable-sandbox
+   swift build --disable-sandbox -c release
+   ```
+
+5. 提交
+
+   ```bash
+   git add .github/workflows/ci.yml docs/plan_ci_ripgrep_dependency.mdc
+   git commit -m "fix: install ripgrep in CI"
+   ```
+
+## 验证标准
+
+- 工作流显式安装 ripgrep，并保留公开仓库门禁、Swift 测试和 Release 构建。
+- 本地公开仓库门禁通过。
+- Swift 测试全部通过。
+- Release 构建成功。
+- 推送后 GitHub Actions 的最新 `CI / verify` 结论为 `success`。
+
+## 自检
+
+- 需求覆盖：失败原因、依赖安装、本地回归和远程 Actions 验证均有明确步骤。
+- 占位符扫描：计划没有未决占位内容。
+- 类型一致性：本次不改变 Swift 类型或接口。
+- 步骤完整性：实现任务包含失败验证、最小实现、通过验证和提交命令。
+- 命令可复制：所有命令均从仓库根目录直接执行。

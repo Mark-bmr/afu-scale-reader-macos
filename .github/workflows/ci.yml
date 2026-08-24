@@ -14,6 +14,8 @@ jobs:
     steps:
       - name: Check out source
         uses: actions/checkout@v7
+      - name: Install audit dependency
+        run: brew install ripgrep
       - name: Public repository gate
         run: bash scripts/check-public-repo.sh
       - name: Run tests
