@@ -1,0 +1,123 @@
+# 体脂秤多条结果读取修复实现计划
+
+> **目标**：正确区分 AFU `D5` 实时体重、`D6` 最终结果与 `D8` 历史记录，让同一次连接中下发的每条不同称重结果都进入持久化，同时继续抑制设备重发的相同结果。
+> **架构**：在 `AFUCore` 中完成协议分帧和会话转换，`AFUReader` 只负责按帧类型调度。实时 `D5` 仍经过收敛与超时回退；最终 `D6` 和历史 `D8` 直接形成稳定测量，再交给现有存储去重层。
+> **技术栈**：Swift 6、CoreBluetooth、Swift Package Manager、XCTest
+
+---
+
+## 根因证据
+
+- 本机日志显示第一组三个稳定体重包保存后，会话进入 `emitted`；同一连接后续 55 个稳定包不再产出记录。
+- 同一段日志随后收到 4 个 `data[18] == 0xD6` 的 20 字节包，当前代码把它们全部当作“测量结束”并丢弃。
+- 两个独立公开实现及其协议测试一致表明：`D5` 是实时体重包，`D6` 是包含最终体重和 ADC/阻抗的结果包，`D8` 是包含设备时间的历史记录包。
+- 当前 `D5` 解析还把功能位 `data[8...9]` 误作阻抗；真正的 ADC/阻抗位于 `D6` 或 `D8` 的对应字段。
+
+## 改动范围
+
+| 文件 | 改动类型 | 改动说明 | 影响面 |
+|------|----------|----------|--------|
+| `Sources/AFUCore/AFUPacket.swift` | 修改 | 增加 `D5`、`D6`、`D8` 分帧解析及历史时间/剩余条数字段 | 蓝牙通知到协议对象的转换 |
+| `Sources/AFUCore/MeasurementDeduplicator.swift` | 修改 | 增加最终结果入口，清理实时候选并逐条返回最终/历史测量 | 单次连接内的会话状态 |
+| `Sources/AFUReader/BluetoothReader.swift` | 修改 | 不再丢弃 `D6`；按帧类型处理实时、最终和历史记录 | 蓝牙回调到持久化队列 |
+| `Tests/AFUCoreTests/AFUPacketTests.swift` | 修改 | 使用纯合成帧覆盖三种包型及错误边界 | 协议回归测试 |
+| `Tests/AFUCoreTests/MeasurementDeduplicatorTests.swift` | 修改 | 覆盖一段实时流后连续收到多条最终结果的场景 | 多条结果回归测试 |
+| `docs/body-composition-algorithm.md` | 修改 | 更正原始 ADC/阻抗字段来源说明 | 用户可见技术文档 |
+| `docs/plan_batched_measurements.mdc` | 新增 | 记录根因、数据流、测试与验证 | 不参与应用运行 |
+
+不改变配置格式、Markdown/JSON 存储结构、体成分算法版本、安装路径和原始帧隐私策略。
+
+## 数据链路
+
+```text
+FFB2 蓝牙通知
+  → AFUPacket 校验魔数、长度和包型
+  ├─ D5 实时体重
+  │    → MeasurementSessionTracker 收敛
+  │    → 仅在没有最终包时由静默超时/离秤/断连回退保存
+  ├─ D6 最终结果
+  │    → 丢弃尚未保存的 D5 候选
+  │    → 使用 D6 的最终体重和第一路 ADC 形成稳定测量
+  └─ D8 历史记录
+       → 使用设备内时间、历史体重和第一路 ADC 形成稳定测量
+       → 暴露剩余历史条数用于诊断日志
+  → persistenceQueue 保序处理
+  → MeasurementStore 按既有时间窗、体重和 ADC 签名去重
+  → Markdown 或 JSON 权威文件与输出镜像
+```
+
+设备重复发送完全相同的 `D6` 时，现有存储去重继续阻止重复落盘；设备连续发送不同体重或不同 ADC 的多条 `D6`/`D8` 时，每条都进入存储。`D8` 使用设备时间，因此相同数值但发生在不同时间的历史记录不会被误判为同一次测量。
+
+## Task 1：用测试锁定真实包型
+
+**文件**：修改 `Tests/AFUCoreTests/AFUPacketTests.swift`
+
+1. 新增纯合成 `D5` 测试，断言稳定标志来自重量编码状态位，且功能位不再被当作阻抗。
+2. 新增纯合成 `D6` 测试，断言最终体重从结果字段读取，第一路 ADC 被保留，包型为最终结果。
+3. 新增纯合成 `D8` 测试，断言设备时间、体重、ADC 和剩余历史条数被解析。
+4. 先运行定向测试，确认旧实现至少在 `D6` 与 `D8` 用例上失败：
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache \
+   SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache \
+   swift test --disable-sandbox --scratch-path /tmp/afu-scale-build \
+     --filter AFUPacketTests
+   ```
+
+5. 实现最小分帧解析，再运行同一命令确认通过。
+
+## Task 2：逐条输出最终与历史结果
+
+**文件**：修改 `Tests/AFUCoreTests/MeasurementDeduplicatorTests.swift`、`Sources/AFUCore/MeasurementDeduplicator.swift`
+
+1. 新增失败测试：先输入一组 `D5` 实时流，再连续输入三条不同的合成 `D6`，预期得到三条稳定测量，而不是只得到第一条实时读数。
+2. 新增测试：相同 `D6` 重发时，转换层仍返回结果，但既有 `MeasurementDeduplicator` 判定为重复，职责边界保持清晰。
+3. 为会话跟踪器增加最终结果入口：清空尚未落盘的实时候选、重置会话锁，并使用包内设备时间或接收时间生成 `StableMeasurement`。
+4. 运行定向测试：
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache \
+   SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache \
+   swift test --disable-sandbox --scratch-path /tmp/afu-scale-build \
+     --filter MeasurementDeduplicatorTests
+   ```
+
+## Task 3：接入蓝牙读取与文档
+
+**文件**：修改 `Sources/AFUReader/BluetoothReader.swift`、`docs/body-composition-algorithm.md`
+
+1. 删除把 `D6` 提前判作完成并返回的分支。
+2. `D5` 沿用收敛和静默计时器；`D6`/`D8` 取消实时回退计时器，逐条进入持久化队列。
+3. 日志只记录包型、是否来自历史及剩余条数；默认级别继续不记录体重、ADC、原始帧或设备标识。
+4. 更正文档中“第 8-9 字节是阻抗”的错误描述，说明持久化值来自最终/历史结果的第一路 ADC，物理单位仍未确认。
+
+## 验证标准
+
+- 基线 86 个测试继续通过，新增协议和多结果测试通过。
+- 合成的一条 `D5` 流加三条不同 `D6` 会产生三条稳定结果。
+- 相同最终包重发不会在 Markdown/JSON 中产生重复行。
+- `D8` 保留设备时间，且不同历史时间不会被 120 秒接收窗口误抑制。
+- Release 构建成功，公开仓库隐私门禁通过。
+- 安装修复版后，真实设备一次连接下发的多条不同结果均写入输出；日志中不出现原始健康数据。
+
+验证命令：
+
+```bash
+CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache \
+SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache \
+swift test --disable-sandbox --scratch-path /tmp/afu-scale-build
+
+CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache \
+SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache \
+swift build --disable-sandbox --scratch-path /tmp/afu-scale-release -c release
+
+bash scripts/check-public-repo.sh
+```
+
+## 自检
+
+- 需求覆盖：实时回退、最终结果、多条历史、重复抑制和真实设备回归都有明确验证。
+- 隐私边界：测试帧全部为人工合成值，不复制本机日志中的体重、阻抗、时间或设备标识。
+- 类型一致性：蓝牙层、会话层和存储层继续使用 `StableMeasurement`；协议包只新增来源和设备时间信息。
+- 职责边界：包解析负责字段语义，会话跟踪负责候选清理，存储层继续负责跨包/跨重启去重。
+- 步骤完整性：每项实现均有先失败、再实现、再回归的可执行测试路径。

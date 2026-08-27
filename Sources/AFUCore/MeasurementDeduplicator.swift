@@ -169,6 +169,28 @@ public struct MeasurementSessionTracker: Sendable {
         return candidate.measurement
     }
 
+    public mutating func receiveFinalResult(
+        _ packet: AFUPacket,
+        at receivedAt: Date,
+        deviceName: String
+    ) -> StableMeasurement? {
+        guard packet.kind == .finalResult || packet.kind == .history else {
+            return nil
+        }
+
+        candidate = nil
+        state = .idle
+        guard packet.weightKilograms >= 1 else { return nil }
+
+        return StableMeasurement(
+            measuredAt: packet.measuredAt ?? receivedAt,
+            weightKilograms: packet.weightKilograms,
+            impedanceRawCode: packet.impedanceRawCode,
+            rawHex: packet.rawHex,
+            deviceName: deviceName
+        )
+    }
+
     public mutating func disconnect(at _: Date) -> StableMeasurement? {
         endSession()
     }

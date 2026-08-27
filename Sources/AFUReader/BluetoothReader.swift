@@ -169,17 +169,30 @@ final class BluetoothReader: NSObject {
 
     private func handle(_ data: Data, deviceName: String) {
         let receivedAt = Date()
-        if AFUPacket.isMeasurementCompletion(data) {
-            log("Measurement completion packet")
-            flushTimer?.invalidate()
-            if let measurement = sessionTracker.measurementCompleted(at: receivedAt) {
-                enqueueForPersistence(measurement)
-            }
-            return
-        }
-
         do {
             let packet = try AFUPacket(data: data)
+
+            if packet.kind == .finalResult || packet.kind == .history {
+                flushTimer?.invalidate()
+                if packet.kind == .history {
+                    info("Historical measurement result received")
+                    log(
+                        "History result detail remaining_count="
+                            + (packet.remainingHistoryCount.map(String.init) ?? "unknown")
+                    )
+                } else {
+                    info("Final measurement result received")
+                }
+                if let measurement = sessionTracker.receiveFinalResult(
+                    packet,
+                    at: receivedAt,
+                    deviceName: deviceName
+                ) {
+                    enqueueForPersistence(measurement)
+                }
+                return
+            }
+
             log(
                 String(
                     format: "Packet detail weight_kg=%.2f stable=%@ impedance_raw=%@",

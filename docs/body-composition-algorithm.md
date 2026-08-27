@@ -2,7 +2,7 @@
 
 ## 结论
 
-AFU 帧第 8-9 字节当前只能确认是一个无符号原始码，不能确认单位是 Ω。项目不会把该原始码直接代入要求物理阻抗的通用 BIA 公式。
+AFU 的 `D6` 最终结果包和 `D8` 历史记录包会携带一组 ADC/阻抗原始值；项目保存其中第一路无符号码，但目前不能确认其物理单位是 Ω。`D5` 实时体重包的第 8-9 字节属于功能字段，不再当作阻抗。项目不会把原始码直接代入要求物理阻抗的通用 BIA 公式。
 
 `afu-cun-bae-v2` 使用不依赖 ADC 的 CUN-BAE 成人体脂公式。该数值用于个人趋势观察，不代替医院检查，也不保证与厂商 App 完全一致。
 
@@ -12,6 +12,8 @@ AFU 帧第 8-9 字节当前只能确认是一个无符号原始码，不能确�
 
 - [carl-chang/afu_scale](https://github.com/carl-chang/afu_scale)
 - [QINZY8/afu-ha](https://github.com/QINZY8/afu-ha)
+- [Fatpandac/AFUScale](https://github.com/Fatpandac/AFUScale)
+- [Mzdyl/ant-afu-welland-scale](https://github.com/Mzdyl/ant-afu-welland-scale)
 - [maoziban/smart-body-scale-IOS](https://github.com/maoziban/smart-body-scale-IOS)
 - [maoziban/smart-body-scale-android](https://github.com/maoziban/smart-body-scale-android)
 - [BodyMiScale](https://github.com/dckiller51/bodymiscale)

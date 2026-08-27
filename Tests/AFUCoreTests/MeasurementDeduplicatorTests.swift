@@ -110,6 +110,85 @@ final class MeasurementDeduplicatorTests: XCTestCase {
         ))
     }
 
+    func testEachSyntheticD6ResultEmitsDuringOneConnection() throws {
+        var tracker = MeasurementSessionTracker(settleInterval: 2)
+        let start = Date(timeIntervalSince1970: 3_700)
+
+        XCTAssertNil(tracker.receive(
+            try livePacket(weight: 70, stable: true),
+            at: start,
+            deviceName: "AFU-WL-TZ-A1"
+        ))
+        XCTAssertNil(tracker.receive(
+            try livePacket(weight: 70, stable: true),
+            at: start.addingTimeInterval(0.15),
+            deviceName: "AFU-WL-TZ-A1"
+        ))
+        XCTAssertNil(tracker.receive(
+            try livePacket(weight: 70, stable: true),
+            at: start.addingTimeInterval(0.3),
+            deviceName: "AFU-WL-TZ-A1"
+        ))
+
+        let expected: [(weight: Double, impedance: Int)] = [
+            (70.1, 710),
+            (70.2, 720),
+            (70.3, 730),
+        ]
+        let emitted = try expected.enumerated().compactMap { index, item in
+            tracker.receiveFinalResult(
+                try finalPacket(weight: item.weight, impedance: item.impedance),
+                at: start.addingTimeInterval(1 + Double(index)),
+                deviceName: "AFU-WL-TZ-A1"
+            )
+        }
+
+        XCTAssertEqual(emitted.map(\.weightKilograms), expected.map(\.weight))
+        XCTAssertEqual(emitted.map(\.impedanceRawCode), expected.map { Optional($0.impedance) })
+    }
+
+    func testRepeatedSyntheticD6IsLeftForStoreDeduplication() throws {
+        var tracker = MeasurementSessionTracker(settleInterval: 2)
+        let deduplicator = MeasurementDeduplicator(window: 120)
+        let start = Date(timeIntervalSince1970: 3_800)
+        let packet = try finalPacket(weight: 70, impedance: 700)
+
+        let first = try XCTUnwrap(tracker.receiveFinalResult(
+            packet,
+            at: start,
+            deviceName: "AFU-WL-TZ-A1"
+        ))
+        let repeated = try XCTUnwrap(tracker.receiveFinalResult(
+            packet,
+            at: start.addingTimeInterval(1),
+            deviceName: "AFU-WL-TZ-A1"
+        ))
+
+        XCTAssertTrue(deduplicator.isDuplicate(repeated.signature, comparedWith: first.signature))
+    }
+
+    func testSyntheticD8ResultsUseDeviceTimeForDeduplication() throws {
+        var tracker = MeasurementSessionTracker(settleInterval: 2)
+        let deduplicator = MeasurementDeduplicator(window: 120)
+        let firstTimestamp: UInt32 = 1_600_000_000
+        let secondTimestamp = firstTimestamp + 300
+
+        let first = try XCTUnwrap(tracker.receiveFinalResult(
+            try historyPacket(weight: 70, impedance: 700, timestamp: firstTimestamp),
+            at: Date(timeIntervalSince1970: 4_000),
+            deviceName: "AFU-WL-TZ-A1"
+        ))
+        let second = try XCTUnwrap(tracker.receiveFinalResult(
+            try historyPacket(weight: 70, impedance: 700, timestamp: secondTimestamp),
+            at: Date(timeIntervalSince1970: 4_001),
+            deviceName: "AFU-WL-TZ-A1"
+        ))
+
+        XCTAssertEqual(first.measuredAt, Date(timeIntervalSince1970: TimeInterval(firstTimestamp)))
+        XCTAssertEqual(second.measuredAt, Date(timeIntervalSince1970: TimeInterval(secondTimestamp)))
+        XCTAssertFalse(deduplicator.isDuplicate(second.signature, comparedWith: first.signature))
+    }
+
     func testWaitsForMissingImpedanceThenFlushesWeight() throws {
         var tracker = MeasurementSessionTracker(settleInterval: 2)
         let start = Date(timeIntervalSince1970: 4_000)
@@ -278,5 +357,79 @@ final class MeasurementDeduplicatorTests: XCTestCase {
             UInt8(impedance / 256),
             UInt8(impedance % 256)
         ]))
+    }
+
+    private func livePacket(weight: Double, stable: Bool) throws -> AFUPacket {
+        var data = framedPacket(type: 0xD5)
+        encodeWeight(weight, state: stable, into: &data, stateIndex: 2, weightIndex: 3)
+        finishChecksum(&data)
+        return try AFUPacket(data: Data(data))
+    }
+
+    private func finalPacket(weight: Double, impedance: Int) throws -> AFUPacket {
+        var data = framedPacket(type: 0xD6)
+        data[2] = 0x02
+        encodeUInt16(impedance, into: &data, at: 4)
+        encodeUInt16(max(impedance - 30, 1), into: &data, at: 6)
+        data[8] = 0x01
+        encodeWeight(weight, state: true, into: &data, stateIndex: 9, weightIndex: 10)
+        finishChecksum(&data)
+        return try AFUPacket(data: Data(data))
+    }
+
+    private func historyPacket(
+        weight: Double,
+        impedance: Int,
+        timestamp: UInt32
+    ) throws -> AFUPacket {
+        var data = framedPacket(type: 0xD8)
+        data[2] = 0x02
+        encodeUInt32(timestamp, into: &data, at: 3)
+        encodeWeight(weight, state: true, into: &data, stateIndex: 7, weightIndex: 8)
+        data[11] = 0x00
+        data[12] = 0x01
+        encodeUInt16(impedance, into: &data, at: 13)
+        finishChecksum(&data)
+        return try AFUPacket(data: Data(data))
+    }
+
+    private func framedPacket(type: UInt8) -> [UInt8] {
+        var data = [UInt8](repeating: 0, count: 20)
+        data[0] = 0xAC
+        data[1] = 0x29
+        data[17] = 0x29
+        data[18] = type
+        return data
+    }
+
+    private func encodeWeight(
+        _ weight: Double,
+        state: Bool,
+        into data: inout [UInt8],
+        stateIndex: Int,
+        weightIndex: Int
+    ) {
+        let rawWeight = Int((weight * 1_000).rounded())
+        data[stateIndex] = state ? 0x80 : 0x00
+        data[weightIndex] = UInt8(rawWeight / 65_536 + 0x68)
+        let remainder = rawWeight % 65_536
+        data[weightIndex + 1] = UInt8(remainder / 256)
+        data[weightIndex + 2] = UInt8(remainder % 256)
+    }
+
+    private func encodeUInt16(_ value: Int, into data: inout [UInt8], at index: Int) {
+        data[index] = UInt8(value / 256)
+        data[index + 1] = UInt8(value % 256)
+    }
+
+    private func encodeUInt32(_ value: UInt32, into data: inout [UInt8], at index: Int) {
+        data[index] = UInt8((value >> 24) & 0xFF)
+        data[index + 1] = UInt8((value >> 16) & 0xFF)
+        data[index + 2] = UInt8((value >> 8) & 0xFF)
+        data[index + 3] = UInt8(value & 0xFF)
+    }
+
+    private func finishChecksum(_ data: inout [UInt8]) {
+        data[19] = UInt8(data[2 ... 18].reduce(0) { $0 + Int($1) } & 0x1F)
     }
 }
