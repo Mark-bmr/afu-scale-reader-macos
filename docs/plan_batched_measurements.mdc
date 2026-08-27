@@ -1,7 +1,7 @@
 # 体脂秤多条结果读取修复实现计划
 
-> **目标**：正确区分 AFU `D5` 实时体重、`D6` 最终结果与 `D8` 历史记录，让同一次连接中下发的每条不同称重结果都进入持久化，同时继续抑制设备重发的相同结果。
-> **架构**：在 `AFUCore` 中完成协议分帧和会话转换，`AFUReader` 只负责按帧类型调度。实时 `D5` 仍经过收敛与超时回退；最终 `D6` 和历史 `D8` 直接形成稳定测量，再交给现有存储去重层。
+> **目标**：正确区分 AFU `D5` 实时体重、`D6` 最终结果与 `D8` 历史记录，让同一次连接中下发的每条不同称重结果都进入持久化，同时继续抑制设备重发和实时/最终双写。
+> **架构**：在 `AFUCore` 中完成协议分帧和会话转换，`AFUReader` 只负责按帧类型调度。20 字节 `D5` 经过收敛后等待对应的 `D6`，仅在离秤或断连时回退；没有最终包语义的旧短帧继续使用超时回退。最终 `D6` 和历史 `D8` 直接形成稳定测量，再交给现有存储去重层。
 > **技术栈**：Swift 6、CoreBluetooth、Swift Package Manager、XCTest
 
 ---
@@ -12,6 +12,12 @@
 - 同一段日志随后收到 4 个 `data[18] == 0xD6` 的 20 字节包，当前代码把它们全部当作“测量结束”并丢弃。
 - 两个独立公开实现及其协议测试一致表明：`D5` 是实时体重包，`D6` 是包含最终体重和 ADC/阻抗的结果包，`D8` 是包含设备时间的历史记录包。
 - 当前 `D5` 解析还把功能位 `data[8...9]` 误作阻抗；真正的 ADC/阻抗位于 `D6` 或 `D8` 的对应字段。
+
+## 真实设备证据
+
+- 修复版在真实设备上连续观察到两轮相同序列：约 80 个 `D5` 实时包后，实时回退记录先落盘；约 6 秒后收到首个 `D6` 最终结果并再次落盘，随后三个相同 `D6` 被存储层抑制。
+- 两轮序列共收到 8 个 `D6`，其中 6 个重发被正确抑制，但每轮仍产生一条无 ADC 的 `D5` 记录和一条带 ADC 的 `D6` 记录。
+- 根因是 20 字节 `D5` 沿用了旧短帧的 2 秒超时回退，而该设备的 `D6` 会更晚到达。修复边界是只禁止协议明确会等待最终结果的 `D5` 超时落盘，不改变旧短帧行为。
 
 ## 改动范围
 
@@ -34,7 +40,7 @@ FFB2 蓝牙通知
   → AFUPacket 校验魔数、长度和包型
   ├─ D5 实时体重
   │    → MeasurementSessionTracker 收敛
-  │    → 仅在没有最终包时由静默超时/离秤/断连回退保存
+  │    → 等待 D6；仅在离秤/断连且没有最终包时回退保存
   ├─ D6 最终结果
   │    → 丢弃尚未保存的 D5 候选
   │    → 使用 D6 的最终体重和第一路 ADC 形成稳定测量
@@ -87,15 +93,45 @@ FFB2 蓝牙通知
 **文件**：修改 `Sources/AFUReader/BluetoothReader.swift`、`docs/body-composition-algorithm.md`
 
 1. 删除把 `D6` 提前判作完成并返回的分支。
-2. `D5` 沿用收敛和静默计时器；`D6`/`D8` 取消实时回退计时器，逐条进入持久化队列。
+2. 20 字节 `D5` 只收敛候选并等待最终结果；旧短帧沿用静默计时器；`D6`/`D8` 取消实时回退计时器，逐条进入持久化队列。
 3. 日志只记录包型、是否来自历史及剩余条数；默认级别继续不记录体重、ADC、原始帧或设备标识。
 4. 更正文档中“第 8-9 字节是阻抗”的错误描述，说明持久化值来自最终/历史结果的第一路 ADC，物理单位仍未确认。
+
+## Task 4：阻止 D5 与延迟 D6 双写
+
+**文件**：修改 `Tests/AFUCoreTests/MeasurementDeduplicatorTests.swift`、`Sources/AFUCore/MeasurementDeduplicator.swift`
+
+1. 编写失败测试：输入足够收敛且超过 2 秒的合成 20 字节 `D5`，断言 `receive` 和 `flushIfDue` 均不输出；随后输入 `D6`，只输出一条最终测量。
+2. 编写边界测试：同样的 `D5` 候选在离秤或断连时仍回退输出，保证没有 `D6` 的称重不会丢失。
+3. 运行定向测试并确认旧实现失败：
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache \
+   SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache \
+   swift test --disable-sandbox --scratch-path /tmp/afu-scale-build \
+     --filter MeasurementDeduplicatorTests
+   ```
+
+4. 在 `StableCandidate` 中记录当前候选是否来自 20 字节 `D5`。该类候选不通过时间截止点输出，仍由 `receiveFinalResult`、离秤或断连结束；旧短帧保持既有超时行为。
+5. 重跑定向测试、全量测试、Release 构建和公开仓库隐私门禁，全部通过后提交：
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache \
+   SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache \
+   swift test --disable-sandbox --scratch-path /tmp/afu-scale-build
+
+   git add Sources/AFUCore/MeasurementDeduplicator.swift \
+     Tests/AFUCoreTests/MeasurementDeduplicatorTests.swift \
+     docs/plan_batched_measurements.mdc
+   git commit -m "fix: wait for final scale result"
+   ```
 
 ## 验证标准
 
 - 基线 86 个测试继续通过，新增协议和多结果测试通过。
 - 合成的一条 `D5` 流加三条不同 `D6` 会产生三条稳定结果。
 - 相同最终包重发不会在 Markdown/JSON 中产生重复行。
+- 20 字节 `D5` 即使稳定时间超过配置的回退间隔也不会先于 `D6` 落盘；离秤或断连时仍可回退保存。
 - `D8` 保留设备时间，且不同历史时间不会被 120 秒接收窗口误抑制。
 - Release 构建成功，公开仓库隐私门禁通过。
 - 安装修复版后，真实设备一次连接下发的多条不同结果均写入输出；日志中不出现原始健康数据。

@@ -82,6 +82,7 @@ public struct MeasurementSessionTracker: Sendable {
         var measurement: StableMeasurement
         var matchingSamples: Int
         let deadline: Date
+        let expectsFinalResult: Bool
     }
 
     public let settleInterval: TimeInterval
@@ -139,7 +140,8 @@ public struct MeasurementSessionTracker: Sendable {
             candidate = StableCandidate(
                 measurement: stableMeasurement,
                 matchingSamples: 1,
-                deadline: receivedAt.addingTimeInterval(settleInterval)
+                deadline: receivedAt.addingTimeInterval(settleInterval),
+                expectsFinalResult: packet.diagnosticOpcode == 0xD5
             )
         }
         state = .measuring
@@ -148,7 +150,9 @@ public struct MeasurementSessionTracker: Sendable {
             return nil
         }
 
-        if candidate.measurement.impedanceRawCode != nil || receivedAt >= candidate.deadline {
+        if candidate.measurement.impedanceRawCode != nil
+            || (!candidate.expectsFinalResult && receivedAt >= candidate.deadline)
+        {
             self.candidate = nil
             state = .emitted
             return candidate.measurement
@@ -159,6 +163,7 @@ public struct MeasurementSessionTracker: Sendable {
     public mutating func flushIfDue(at date: Date) -> StableMeasurement? {
         guard state != .emitted,
               let candidate,
+              !candidate.expectsFinalResult,
               candidate.matchingSamples >= minimumMatchingSamples,
               date >= candidate.deadline
         else {
