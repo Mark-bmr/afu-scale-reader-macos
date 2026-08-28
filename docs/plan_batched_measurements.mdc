@@ -1,7 +1,7 @@
 # 体脂秤多条结果读取修复实现计划
 
 > **目标**：正确区分 AFU `D5` 实时体重、`D6` 最终结果与 `D8` 历史记录，让同一次连接中下发的每条不同称重结果都进入持久化，同时继续抑制设备重发和实时/最终双写。
-> **架构**：在 `AFUCore` 中完成协议分帧和会话转换，`AFUReader` 只负责按帧类型调度。20 字节 `D5` 经过收敛后等待对应的 `D6`，仅在离秤或断连时回退；没有最终包语义的旧短帧继续使用超时回退。最终 `D6` 和历史 `D8` 直接形成稳定测量，再交给现有存储去重层。
+> **架构**：在 `AFUCore` 中完成协议分帧和会话转换，`AFUReader` 只负责按帧类型与连接生命周期调度。20 字节 `D5` 经过收敛后等待对应的 `D6`；普通离秤立即回退，瞬时 BLE 断线则保留候选并等待重连宽限期，没有最终包语义的旧短帧继续使用原有回退。最终 `D6` 和历史 `D8` 直接形成稳定测量，再交给现有存储去重层。
 > **技术栈**：Swift 6、CoreBluetooth、Swift Package Manager、XCTest
 
 ---
@@ -18,14 +18,16 @@
 - 修复版在真实设备上连续观察到两轮相同序列：约 80 个 `D5` 实时包后，实时回退记录先落盘；约 6 秒后收到首个 `D6` 最终结果并再次落盘，随后三个相同 `D6` 被存储层抑制。
 - 两轮序列共收到 8 个 `D6`，其中 6 个重发被正确抑制，但每轮仍产生一条无 ADC 的 `D5` 记录和一条带 ADC 的 `D6` 记录。
 - 根因是 20 字节 `D5` 沿用了旧短帧的 2 秒超时回退，而该设备的 `D6` 会更晚到达。修复边界是只禁止协议明确会等待最终结果的 `D5` 超时落盘，不改变旧短帧行为。
+- 第二版在完整休眠后实测收到 21 个实时包和 4 个最终包，但仍新增两行：第一段连接收到 4 个实时包后短暂断线并立即保存，约 2 秒后重连继续接收实时包，首个最终包随后到达并再次保存。
+- 这证明设备会在同一次物理测量中短暂断开再重连。连接断开不能直接等同于测量结束；只有离秤包、不可恢复的蓝牙状态或重连宽限期到期才能触发无最终包回退。
 
 ## 改动范围
 
 | 文件 | 改动类型 | 改动说明 | 影响面 |
 |------|----------|----------|--------|
 | `Sources/AFUCore/AFUPacket.swift` | 修改 | 增加 `D5`、`D6`、`D8` 分帧解析及历史时间/剩余条数字段 | 蓝牙通知到协议对象的转换 |
-| `Sources/AFUCore/MeasurementDeduplicator.swift` | 修改 | 增加最终结果入口，清理实时候选并逐条返回最终/历史测量 | 单次连接内的会话状态 |
-| `Sources/AFUReader/BluetoothReader.swift` | 修改 | 不再丢弃 `D6`；按帧类型处理实时、最终和历史记录 | 蓝牙回调到持久化队列 |
+| `Sources/AFUCore/MeasurementDeduplicator.swift` | 修改 | 增加最终结果入口，并在瞬时断线时保留等待最终结果的实时候选 | 跨短暂重连的测量会话状态 |
+| `Sources/AFUReader/BluetoothReader.swift` | 修改 | 按帧类型处理实时、最终和历史记录，并为瞬时断线维护重连宽限计时 | 蓝牙回调到持久化队列 |
 | `Tests/AFUCoreTests/AFUPacketTests.swift` | 修改 | 使用纯合成帧覆盖三种包型及错误边界 | 协议回归测试 |
 | `Tests/AFUCoreTests/MeasurementDeduplicatorTests.swift` | 修改 | 覆盖一段实时流后连续收到多条最终结果的场景 | 多条结果回归测试 |
 | `docs/body-composition-algorithm.md` | 修改 | 更正原始 ADC/阻抗字段来源说明 | 用户可见技术文档 |
@@ -40,7 +42,9 @@ FFB2 蓝牙通知
   → AFUPacket 校验魔数、长度和包型
   ├─ D5 实时体重
   │    → MeasurementSessionTracker 收敛
-  │    → 等待 D6；仅在离秤/断连且没有最终包时回退保存
+  │    → 等待 D6
+  │    → 离秤时立即回退
+  │    → 瞬时断线时跨重连保留；最后一个实时包后经过连接超时与重试间隔才回退
   ├─ D6 最终结果
   │    → 丢弃尚未保存的 D5 候选
   │    → 使用 D6 的最终体重和第一路 ADC 形成稳定测量
@@ -126,15 +130,58 @@ FFB2 蓝牙通知
    git commit -m "fix: wait for final scale result"
    ```
 
+## Task 5：跨瞬时断线保留 D5 候选
+
+**文件**：修改 `Tests/AFUCoreTests/MeasurementDeduplicatorTests.swift`、`Sources/AFUCore/MeasurementDeduplicator.swift`、`Sources/AFUReader/BluetoothReader.swift`
+
+1. 编写失败测试：三个合成 `D5` 收敛后触发 `connectionInterrupted`，断言不输出临时测量；模拟重连继续接收 `D5` 后输入 `D6`，只输出带 ADC 的最终测量。
+2. 编写边界测试：瞬时断线后始终没有重连或 `D6` 时，调用确定性 `disconnect` 仍输出已收敛的 D5；旧短帧在连接中断时保持立即回退。
+3. 运行定向测试，确认旧实现因缺少瞬时断线语义而失败：
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache \
+   SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache \
+   swift test --disable-sandbox --scratch-path /tmp/afu-scale-build \
+     --filter MeasurementDeduplicatorTests
+   ```
+
+4. 在 `MeasurementSessionTracker` 增加 `connectionInterrupted(at:)`：只为等待 `D6` 的候选保留状态，旧短帧沿用立即结束；确定性 `disconnect(at:)` 和离秤仍结束会话。在 `BluetoothReader` 增加一个断线宽限计时器，宽限时长为现有 `connectionTimeout + retryDelay`，重连后的实时包会续期，最终包、离秤、蓝牙不可用或宽限到期会取消并结束计时。
+5. 重跑定向测试、全量测试、Release 构建和公开仓库隐私门禁；安装后从秤休眠状态开始实测，要求首个 `D6` 前保存数为零、单次测量只新增一行：
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache \
+   SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache \
+   swift test --disable-sandbox --scratch-path /tmp/afu-scale-build
+
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache \
+   SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache \
+   swift build --disable-sandbox --scratch-path /tmp/afu-scale-release -c release
+
+   bash scripts/check-public-repo.sh
+
+   git add Sources/AFUCore/MeasurementDeduplicator.swift \
+     Sources/AFUReader/BluetoothReader.swift \
+     Tests/AFUCoreTests/MeasurementDeduplicatorTests.swift \
+     docs/plan_batched_measurements.mdc
+   git commit -m "fix: preserve measurement across reconnect"
+   ```
+
 ## 验证标准
 
 - 基线 86 个测试继续通过，新增协议和多结果测试通过。
 - 合成的一条 `D5` 流加三条不同 `D6` 会产生三条稳定结果。
 - 相同最终包重发不会在 Markdown/JSON 中产生重复行。
-- 20 字节 `D5` 即使稳定时间超过配置的回退间隔也不会先于 `D6` 落盘；离秤或断连时仍可回退保存。
+- 20 字节 `D5` 即使稳定时间超过配置的回退间隔也不会先于 `D6` 落盘；离秤、确定性断连或重连宽限期结束时仍可回退保存。
+- 同一次测量发生短暂断线并重连时，D5 候选不会在首个 D6 前落盘；没有重连时在宽限期结束后仍会回退保存。
 - `D8` 保留设备时间，且不同历史时间不会被 120 秒接收窗口误抑制。
 - Release 构建成功，公开仓库隐私门禁通过。
 - 安装修复版后，真实设备一次连接下发的多条不同结果均写入输出；日志中不出现原始健康数据。
+
+## 最终实机验收
+
+- 从 37 条记录开始完成一次真实体脂测量；本轮发生一次 BLE 断线，并跨重连收到 69 个实时包和 4 个最终包。
+- 首个最终包到达前保存数为 0；最终只新增 1 条记录，另外 3 个重复最终包均被存储去重抑制。
+- 本轮历史包、不支持包和错误均为 0，证明瞬时断线不再造成 D5 临时结果与 D6 最终结果双写。
 
 验证命令：
 

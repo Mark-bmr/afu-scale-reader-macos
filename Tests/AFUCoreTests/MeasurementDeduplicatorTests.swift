@@ -210,6 +210,88 @@ final class MeasurementDeduplicatorTests: XCTestCase {
         XCTAssertNil(fallback?.impedanceRawCode)
     }
 
+    func testD5SurvivesTransientDisconnectUntilFinalResultAfterReconnect() throws {
+        var tracker = MeasurementSessionTracker(settleInterval: 2)
+        let start = Date(timeIntervalSince1970: 3_780)
+
+        XCTAssertNil(tracker.receive(
+            try livePacket(weight: 70, stable: true),
+            at: start,
+            deviceName: "AFU-WL-TZ-A1"
+        ))
+        XCTAssertNil(tracker.receive(
+            try livePacket(weight: 70, stable: true),
+            at: start.addingTimeInterval(0.15),
+            deviceName: "AFU-WL-TZ-A1"
+        ))
+        XCTAssertNil(tracker.receive(
+            try livePacket(weight: 70, stable: true),
+            at: start.addingTimeInterval(0.3),
+            deviceName: "AFU-WL-TZ-A1"
+        ))
+
+        XCTAssertNil(tracker.connectionInterrupted(at: start.addingTimeInterval(0.4)))
+        XCTAssertNil(tracker.receive(
+            try livePacket(weight: 70, stable: true),
+            at: start.addingTimeInterval(2.4),
+            deviceName: "AFU-WL-TZ-A1"
+        ))
+
+        let final = tracker.receiveFinalResult(
+            try finalPacket(weight: 70, impedance: 700),
+            at: start.addingTimeInterval(4.5),
+            deviceName: "AFU-WL-TZ-A1"
+        )
+
+        XCTAssertEqual(final?.weightKilograms, 70)
+        XCTAssertEqual(final?.impedanceRawCode, 700)
+        XCTAssertNil(tracker.disconnect(at: start.addingTimeInterval(5)))
+    }
+
+    func testInterruptedD5FallsBackWhenReconnectGraceEnds() throws {
+        var tracker = MeasurementSessionTracker(settleInterval: 2)
+        let start = Date(timeIntervalSince1970: 3_785)
+
+        XCTAssertNil(tracker.receive(
+            try livePacket(weight: 70, stable: true),
+            at: start,
+            deviceName: "AFU-WL-TZ-A1"
+        ))
+        XCTAssertNil(tracker.receive(
+            try livePacket(weight: 70, stable: true),
+            at: start.addingTimeInterval(0.15),
+            deviceName: "AFU-WL-TZ-A1"
+        ))
+        XCTAssertNil(tracker.receive(
+            try livePacket(weight: 70, stable: true),
+            at: start.addingTimeInterval(0.3),
+            deviceName: "AFU-WL-TZ-A1"
+        ))
+
+        XCTAssertNil(tracker.connectionInterrupted(at: start.addingTimeInterval(0.4)))
+        let fallback = tracker.disconnect(at: start.addingTimeInterval(9.4))
+
+        XCTAssertEqual(fallback?.weightKilograms, 70)
+        XCTAssertNil(fallback?.impedanceRawCode)
+    }
+
+    func testLegacyPacketFallsBackImmediatelyOnConnectionInterrupted() throws {
+        var tracker = MeasurementSessionTracker(settleInterval: 2)
+        let start = Date(timeIntervalSince1970: 3_790)
+
+        XCTAssertNil(try converge(
+            tracker: &tracker,
+            weight: 65,
+            impedance: 0,
+            start: start
+        ))
+
+        let fallback = tracker.connectionInterrupted(at: start.addingTimeInterval(1))
+
+        XCTAssertEqual(fallback?.weightKilograms, 65)
+        XCTAssertNil(fallback?.impedanceRawCode)
+    }
+
     func testRepeatedSyntheticD6IsLeftForStoreDeduplication() throws {
         var tracker = MeasurementSessionTracker(settleInterval: 2)
         let deduplicator = MeasurementDeduplicator(window: 120)

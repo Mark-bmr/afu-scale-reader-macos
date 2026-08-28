@@ -86,6 +86,10 @@ public struct MeasurementSessionTracker: Sendable {
     }
 
     public let settleInterval: TimeInterval
+    public var isAwaitingFinalResult: Bool {
+        candidate?.expectsFinalResult == true
+    }
+
     private let minimumMatchingSamples = 3
     private let weightTolerance = 0.005
     private var state: State = .idle
@@ -198,6 +202,13 @@ public struct MeasurementSessionTracker: Sendable {
 
     public mutating func disconnect(at _: Date) -> StableMeasurement? {
         endSession()
+    }
+
+    public mutating func connectionInterrupted(at _: Date) -> StableMeasurement? {
+        guard isAwaitingFinalResult else {
+            return endSession()
+        }
+        return nil
     }
 
     public mutating func measurementCompleted(at _: Date) -> StableMeasurement? {

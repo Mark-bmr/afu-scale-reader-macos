@@ -21,6 +21,7 @@ final class BluetoothReader: NSObject {
     private var setupTimeoutTimer: Timer?
     private var retryTimer: Timer?
     private var flushTimer: Timer?
+    private var interruptedSessionTimer: Timer?
     private var persistenceRetryTimer: Timer?
     private var markdownReconciliationTimer: Timer?
     private var persistenceQueue: [StableMeasurement] = []
@@ -50,6 +51,7 @@ final class BluetoothReader: NSObject {
         setupTimeoutTimer?.invalidate()
         retryTimer?.invalidate()
         flushTimer?.invalidate()
+        interruptedSessionTimer?.invalidate()
         persistenceRetryTimer?.invalidate()
         markdownReconciliationTimer?.invalidate()
         if let activePeripheral {
@@ -150,6 +152,29 @@ final class BluetoothReader: NSObject {
         }
     }
 
+    private func scheduleInterruptedSessionFlush() {
+        interruptedSessionTimer?.invalidate()
+        interruptedSessionTimer = Timer.scheduledTimer(
+            timeInterval: configuration.connectionTimeout + configuration.retryDelay,
+            target: self,
+            selector: #selector(interruptedSessionTimerFired(_:)),
+            userInfo: nil,
+            repeats: false
+        )
+    }
+
+    private func cancelInterruptedSessionFlush() {
+        interruptedSessionTimer?.invalidate()
+        interruptedSessionTimer = nil
+    }
+
+    @objc private func interruptedSessionTimerFired(_: Timer) {
+        interruptedSessionTimer = nil
+        if let measurement = sessionTracker.disconnect(at: Date()) {
+            enqueueForPersistence(measurement)
+        }
+    }
+
     private func sendHandshake(to peripheral: CBPeripheral) {
         guard let writeCharacteristic else {
             log("FFB1 write characteristic is missing; notifications remain enabled")
@@ -171,9 +196,11 @@ final class BluetoothReader: NSObject {
         let receivedAt = Date()
         do {
             let packet = try AFUPacket(data: data)
+            let wasWaitingForReconnect = interruptedSessionTimer != nil
 
             if packet.kind == .finalResult || packet.kind == .history {
                 flushTimer?.invalidate()
+                cancelInterruptedSessionFlush()
                 if packet.kind == .history {
                     info("Historical measurement result received")
                     log(
@@ -213,6 +240,14 @@ final class BluetoothReader: NSObject {
                 schedulePendingFlush()
             } else if packet.weightKilograms < 1 {
                 flushTimer?.invalidate()
+            }
+
+            if wasWaitingForReconnect {
+                if sessionTracker.isAwaitingFinalResult {
+                    scheduleInterruptedSessionFlush()
+                } else {
+                    cancelInterruptedSessionFlush()
+                }
             }
         } catch {
             let hex = data.map { String(format: "%02X", $0) }.joined()
@@ -320,6 +355,7 @@ final class BluetoothReader: NSObject {
         let hadActivePeripheral = activePeripheral != nil
         retryTimer?.invalidate()
         flushTimer?.invalidate()
+        cancelInterruptedSessionFlush()
         central?.stopScan()
         if let measurement = sessionTracker.disconnect(at: Date()) {
             enqueueForPersistence(measurement)
@@ -418,8 +454,13 @@ extension BluetoothReader: @preconcurrency CBCentralManagerDelegate {
         error: Error?
     ) {
         guard activePeripheral?.identifier == peripheral.identifier else { return }
-        if let measurement = sessionTracker.disconnect(at: Date()) {
+        if let measurement = sessionTracker.connectionInterrupted(at: Date()) {
             enqueueForPersistence(measurement)
+        }
+        if sessionTracker.isAwaitingFinalResult {
+            scheduleInterruptedSessionFlush()
+        } else {
+            cancelInterruptedSessionFlush()
         }
         flushTimer?.invalidate()
         log("Disconnected: \(error?.localizedDescription ?? "scale is idle")")
