@@ -41,6 +41,8 @@ public struct AFUPacket: Equatable, Sendable {
     public let measuredAt: Date?
     /// Number of older history entries reported by the device after this entry.
     public let remainingHistoryCount: Int?
+    /// History payload variant, when this is a D8 result.
+    public let historyType: UInt8?
     public let rawHex: String
     public let diagnosticOpcode: UInt8?
 
@@ -74,6 +76,7 @@ public struct AFUPacket: Equatable, Sendable {
         impedanceRawCode = parsed.impedanceRawCode
         measuredAt = parsed.measuredAt
         remainingHistoryCount = parsed.remainingHistoryCount
+        historyType = parsed.historyType
         rawHex = data.map { String(format: "%02X", $0) }.joined()
         diagnosticOpcode = data.count >= 19 ? data[18] : nil
     }
@@ -85,6 +88,7 @@ public struct AFUPacket: Equatable, Sendable {
         let impedanceRawCode: Int?
         let measuredAt: Date?
         let remainingHistoryCount: Int?
+        let historyType: UInt8?
     }
 
     private static func parseLiveWeight(_ data: Data) throws -> ParsedPacket {
@@ -95,7 +99,8 @@ public struct AFUPacket: Equatable, Sendable {
             isStable: data[2] & 0x80 != 0 && weightKilograms > 0,
             impedanceRawCode: nil,
             measuredAt: nil,
-            remainingHistoryCount: nil
+            remainingHistoryCount: nil,
+            historyType: nil
         )
     }
 
@@ -108,7 +113,8 @@ public struct AFUPacket: Equatable, Sendable {
             isStable: weightKilograms > 0,
             impedanceRawCode: impedanceRawCode,
             measuredAt: nil,
-            remainingHistoryCount: nil
+            remainingHistoryCount: nil,
+            historyType: nil
         )
     }
 
@@ -141,7 +147,8 @@ public struct AFUPacket: Equatable, Sendable {
             isStable: weightKilograms > 0,
             impedanceRawCode: resultDetails.impedanceRawCode,
             measuredAt: timestamp > 0 ? Date(timeIntervalSince1970: TimeInterval(timestamp)) : nil,
-            remainingHistoryCount: resultDetails.remainingHistoryCount
+            remainingHistoryCount: resultDetails.remainingHistoryCount,
+            historyType: historyType
         )
     }
 
@@ -154,7 +161,8 @@ public struct AFUPacket: Equatable, Sendable {
             isStable: data[6] == 0x02 && weightKilograms > 0,
             impedanceRawCode: impedanceRawCode,
             measuredAt: nil,
-            remainingHistoryCount: nil
+            remainingHistoryCount: nil,
+            historyType: nil
         )
     }
 

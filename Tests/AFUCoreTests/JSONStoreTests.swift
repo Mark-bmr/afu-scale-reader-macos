@@ -40,6 +40,7 @@ final class JSONStoreTests: XCTestCase {
         XCTAssertNil(measurement["device"])
         XCTAssertNil(measurement["device_name"])
         XCTAssertEqual(measurement["weight_kg"] as? Double, 70)
+        XCTAssertEqual(measurement["time_source"] as? String, "received")
         XCTAssertNotNil(measurement["body_fat_percent"])
         XCTAssertEqual(permissions(of: outputURL), 0o600)
         XCTAssertEqual(permissions(of: canonicalURL), 0o600)
@@ -59,6 +60,59 @@ final class JSONStoreTests: XCTestCase {
         XCTAssertTrue(try store.append(record(at: date("2026-08-19T08:30:12Z"))))
         XCTAssertTrue(try store.append(record(at: date("2026-08-19T08:32:13Z"))))
         XCTAssertEqual(try measurementCount(at: outputURL), 2)
+    }
+
+    func testPersistsDistinctDeviceTimesInsideReceivedDeduplicationWindow() throws {
+        let store = makeStore()
+        let first = date("2026-08-19T08:30:12Z")
+        let second = date("2026-08-19T08:31:12Z")
+
+        XCTAssertTrue(try store.append(record(at: first, timeSource: .device)))
+        XCTAssertTrue(try store.append(record(at: second, timeSource: .device)))
+
+        XCTAssertFalse(try makeStore().append(record(at: second, timeSource: .device)))
+        XCTAssertEqual(try measurementCount(at: outputURL), 2)
+    }
+
+    func testSuppressesReplayedDeviceHistoryBatchAfterRestart() throws {
+        let store = makeStore()
+        let first = date("2026-08-19T08:30:12Z")
+        let second = date("2026-08-19T12:30:12Z")
+        XCTAssertTrue(try store.append(record(at: first, timeSource: .device)))
+        XCTAssertTrue(try store.append(record(at: second, timeSource: .device)))
+
+        XCTAssertFalse(try makeStore().append(record(at: first, timeSource: .device)))
+        XCTAssertFalse(try makeStore().append(record(at: second, timeSource: .device)))
+        XCTAssertEqual(try measurementCount(at: outputURL), 2)
+    }
+
+    func testLegacyJSONWithoutTimeSourceStillDecodes() throws {
+        XCTAssertTrue(try makeStore().append(record(at: date("2026-08-19T08:30:12Z"))))
+        let source = try Data(contentsOf: canonicalURL)
+        var document = try XCTUnwrap(JSONSerialization.jsonObject(with: source) as? [String: Any])
+        var measurements = try XCTUnwrap(document["measurements"] as? [[String: Any]])
+        measurements[0].removeValue(forKey: "time_source")
+        document["measurements"] = measurements
+        var legacyData = try JSONSerialization.data(
+            withJSONObject: document,
+            options: [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
+        )
+        legacyData.append(0x0A)
+        try SecureFile.write(legacyData, to: canonicalURL)
+        try SecureFile.write(legacyData, to: outputURL)
+
+        XCTAssertFalse(try makeStore().append(record(at: date("2026-08-19T08:31:00Z"))))
+        XCTAssertEqual(try measurementCount(at: outputURL), 1)
+        XCTAssertEqual(try makeStore().latestWeightKilograms(), 70)
+    }
+
+    func testReturnsLatestWeightForSessionUserMatching() throws {
+        let store = makeStore()
+
+        XCTAssertNil(try store.latestWeightKilograms())
+        XCTAssertTrue(try store.append(record(at: date("2026-08-19T08:30:12Z"), weight: 70)))
+        XCTAssertTrue(try store.append(record(at: date("2026-08-19T08:33:00Z"), weight: 83)))
+        XCTAssertEqual(try store.latestWeightKilograms(), 83)
     }
 
     func testRestoresManagedOutputFromCanonicalMirror() throws {
@@ -90,14 +144,18 @@ final class JSONStoreTests: XCTestCase {
         )
     }
 
-    private func record(at measuredAt: Date) throws -> MeasurementRecord {
+    private func record(
+        at measuredAt: Date,
+        weight: Double = 70,
+        timeSource: MeasurementTimeSource = .received
+    ) throws -> MeasurementRecord {
         let profile = BodyProfile(
             sex: .male,
             heightCentimeters: 175,
             birthDate: date("1990-01-01T00:00:00Z")
         )
         let composition = try BodyCompositionCalculator.calculate(
-            weightKilograms: 70,
+            weightKilograms: weight,
             impedanceRawCode: 800,
             profile: profile,
             measuredAt: measuredAt
@@ -105,10 +163,11 @@ final class JSONStoreTests: XCTestCase {
         return MeasurementRecord(
             measurement: StableMeasurement(
                 measuredAt: measuredAt,
-                weightKilograms: 70,
+                weightKilograms: weight,
                 impedanceRawCode: 800,
                 rawHex: "AC000069117002000320",
-                deviceName: "Synthetic Scale"
+                deviceName: "Synthetic Scale",
+                timeSource: timeSource
             ),
             composition: composition
         )

@@ -1,0 +1,233 @@
+# 体脂秤库存称重同步修复计划
+
+> **目标**：连接 AFU-WL subtype 7 体脂秤后，完整复现厂商 SDK 的 `D1 → D0 → D1 → D0` 用户初始化序列，触发秤回传全部库存称重；每个具有不同设备时间的 `D8` 历史结果都保存一次，同时继续抑制同一结果重发。
+> **架构**：协议字节编码保持在不依赖 CoreBluetooth 的 AFUCore 中，并用厂商 SDK 生成的合成参考帧锁定；BluetoothReader 只负责按 FFB1 写回执串行发送四个初始化包。用户当前体重只从本机权威测量文件读取，缺失时使用厂商 SDK 的 60 kg 缺省值，任何资料均不写入诊断日志。
+> **依据**：公开实现只发送 `D0`，可以收到单个历史结果；对 ICOMON 官方 `ICWeightScale27Worker` 的字节码和编码器验证表明，subtype 7 在 FFB2 通知启用后会连续两次调用 `updateUserList()` 与 `updateInfo()`，形成 `D1 → D0 → D1 → D0`，且处理 `D8` 时不会发送确认包。
+> **技术栈**：Swift 6、CoreBluetooth、Swift Package Manager、XCTest。
+
+## 改动范围
+
+| 文件 | 改动类型 | 改动说明 |
+|---|---|---|
+| `Sources/AFUCore/AFUSessionProfile.swift` | 新增 | 解析厂商广播，并编码厂商一致的 D1 用户包、D0 会话包和四包初始化序列 |
+| `Tests/AFUCoreTests/AFUSessionProfileTests.swift` | 新增 | 用合成数据验证 D1/D0 厂商参考帧、四包顺序、校验和及错误边界 |
+| `Sources/AFUReader/BluetoothReader.swift` | 修改 | 保存协议元数据，订阅 FFB2 后按写回执串行发送 `D1 → D0 → D1 → D0`；日志只记录命令类型和结果 |
+| `Sources/AFUCore/MeasurementStore.swift` | 修改 | 从权威本地文件返回最近一条体重，仅供会话用户匹配 |
+| `Sources/AFUCore/MeasurementDeduplicator.swift` | 修改 | 标记测量时间来自接收端或秤内时钟，并区分实时重发与历史重发 |
+| `Sources/AFUCore/MarkdownStore.swift` | 修改 | 持久化时间来源并从不可见元数据读取最近体重，兼容旧记录缺少该字段 |
+| `Sources/AFUCore/JSONStore.swift` | 修改 | 持久化时间来源并从 JSON 读取最近体重，兼容旧 JSON 缺少该字段 |
+| `Tests/AFUCoreTests/MeasurementDeduplicatorTests.swift` | 修改 | 验证不同设备时间的相同数值历史记录不会互相去重 |
+| `Tests/AFUCoreTests/MarkdownStoreTests.swift` | 修改 | 验证跨重启的历史精确去重及旧元数据兼容性 |
+| `Tests/AFUCoreTests/JSONStoreTests.swift` | 修改 | 验证跨重启的历史精确去重及旧 JSON 兼容性 |
+
+## 数据链路
+
+```text
+CoreBluetooth 广播 manufacturer data
+  → AFUAdvertisementProtocolMetadata 校验 0xAC、category=2、subtype=7
+  → 计算连接型 deviceType 0x27
+  → FFB0 连接并订阅 FFB2
+  → MeasurementStore 从本机权威 Markdown/JSON 读取最近体重；无记录时取厂商缺省值 60 kg
+  → AFUSessionUserPacket 使用用户序号 1、年龄/身高/性别/最近体重编码 D1
+  → AFUSessionProfilePacket 使用当前 Unix 时间、本地 UTC 偏移、相同资料及中性目标体重编码 D0
+  → BluetoothReader 向 FFB1 按回执串行写入 D1、D0、D1、D0
+  → FFB2 回传 D5 / D6 / D8
+  → D8 使用秤内 measuredAt，并标记 timeSource=device
+  → MeasurementStore
+       ├─ received 时间来源：120 秒窗口内相同体重与 ADC 判为实时/最终重发
+       └─ device 时间来源：仅相同秤内时间、体重与 ADC 判为同一历史记录
+  → Markdown 或 JSON 权威文件与输出镜像
+```
+
+## 测试先行任务
+
+1. 新增 D0 编码失败测试：固定时间、东八区、男性、合成身高和年龄，断言 20 字节布局及校验和；覆盖负时区、非法广播、非法年龄/身高与时间边界。
+2. 新增历史去重失败测试：两条体重和 ADC 相同、设备时间相差小于 120 秒的 D8 均应保存；同一 D8 重发应抑制。
+3. 新增 Markdown/JSON 跨重启测试：历史时间不同均保存，同一历史时间抑制；旧数据没有 `time_source` 时仍按旧接收时间规则读取。
+4. 运行定向测试，确认新增行为在实现前失败：
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache \
+   SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache \
+   swift test --disable-sandbox --scratch-path /tmp/afu-scale-build \
+     --filter 'AFUSessionProfileTests|MeasurementDeduplicatorTests|MarkdownStoreTests|JSONStoreTests'
+   ```
+
+## 厂商初始化序列修复任务
+
+### Task 1：固定 D1、完整 D0 与四包顺序
+
+**文件**：修改 `Tests/AFUCoreTests/AFUSessionProfileTests.swift`、`Sources/AFUCore/AFUSessionProfile.swift`
+
+1. 编写失败测试
+
+   ```swift
+   XCTAssertEqual(try AFUSessionUserPacket.encode(/* 合成资料 */), vendorD1)
+   XCTAssertEqual(try AFUSessionProfilePacket.encode(/* 合成资料 */), vendorD0)
+   XCTAssertEqual(try AFUSessionInitializationPackets.encode(/* 合成资料 */).map { $0[18] }, [0xD1, 0xD0, 0xD1, 0xD0])
+   ```
+
+2. 运行测试，确认 `AFUSessionUserPacket` 与 `AFUSessionInitializationPackets` 尚不存在，测试失败
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache swift test --disable-sandbox --scratch-path /tmp/afu-scale-build --filter AFUSessionProfileTests
+   ```
+
+3. 编写最小实现：按厂商编码器的 20 字节布局实现 D1；为 D0 写入百分之一千克的当前/目标体重；两种包共用有限数值、UInt16 范围和校验和校验；初始化编码器只返回 `[D1, D0, D1, D0]`。
+
+   ```swift
+   public static func encode(deviceType: UInt8, profile: BodyProfile, currentWeightKilograms: Double, targetWeightKilograms: Double, at: Date, timeZone: TimeZone) throws -> [Data]
+   ```
+
+4. 重新运行定向测试，确认通过
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache swift test --disable-sandbox --scratch-path /tmp/afu-scale-build --filter AFUSessionProfileTests
+   ```
+
+5. 在全部实机验收通过后，与本轮其余文件一起提交
+
+   ```bash
+   git add Sources/AFUCore/AFUSessionProfile.swift Tests/AFUCoreTests/AFUSessionProfileTests.swift
+   git commit -m "fix: complete scale session initialization"
+   ```
+
+### Task 2：使用最近本地体重进行用户匹配
+
+**文件**：修改 `Tests/AFUCoreTests/MarkdownStoreTests.swift`、`Tests/AFUCoreTests/JSONStoreTests.swift`、`Sources/AFUCore/MarkdownStore.swift`、`Sources/AFUCore/JSONStore.swift`、`Sources/AFUCore/MeasurementStore.swift`
+
+1. 编写失败测试
+
+   ```swift
+   XCTAssertEqual(try store.latestWeightKilograms(), secondSyntheticWeight)
+   ```
+
+   分别覆盖空文件返回 `nil`、两条记录返回最后一条，以及旧格式记录仍可读取。
+
+2. 运行测试，确认读取接口尚不存在，测试失败
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache swift test --disable-sandbox --scratch-path /tmp/afu-scale-build --filter 'MarkdownStoreTests|JSONStoreTests'
+   ```
+
+3. 编写最小实现：Markdown 复用现有 `afu-meta` 签名解析；JSON 复用现有文档解码；MeasurementStore 仅转发对应存储实现。读取失败由 BluetoothReader 记录不含路径和数值的回退事件，并采用 60 kg。
+
+   ```swift
+   public func latestWeightKilograms() throws -> Double?
+   ```
+
+4. 重新运行存储定向测试，确认通过
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache swift test --disable-sandbox --scratch-path /tmp/afu-scale-build --filter 'MarkdownStoreTests|JSONStoreTests'
+   ```
+
+5. 在全部实机验收通过后，与本轮其余文件一起提交
+
+   ```bash
+   git add Sources/AFUCore/MeasurementStore.swift Sources/AFUCore/MarkdownStore.swift Sources/AFUCore/JSONStore.swift Tests/AFUCoreTests/MarkdownStoreTests.swift Tests/AFUCoreTests/JSONStoreTests.swift
+   git commit -m "fix: complete scale session initialization"
+   ```
+
+### Task 3：按 FFB1 写回执发送两轮初始化
+
+**文件**：修改 `Sources/AFUReader/BluetoothReader.swift`
+
+1. Task 1 的初始化顺序测试先固定四包顺序；BluetoothReader 的验收条件为每次连接出现四个成功写入事件和一个初始化完成事件。
+
+   ```swift
+   XCTAssertEqual(packets.map { $0[18] }, [0xD1, 0xD0, 0xD1, 0xD0])
+   ```
+
+2. 在实现前启动当前构建并检查脱敏事件计数，确认每次连接只有一个 D0 写回执
+
+   ```bash
+   awk '/AFU session profile acknowledged/ { count++ } END { print count+0 }' "$HOME/Library/Application Support/AFUScaleReader/AFUScaleReader.log"
+   ```
+
+3. 编写最小实现：通知启用后构建四包队列；特征支持 `.write` 时每次只写一个并在 `didWriteValueFor` 成功后推进；只有 `.writeWithoutResponse` 时依次发送四包；断开或失败时清空队列。日志只允许 `D1`/`D0`、成功/失败和完成状态。
+
+   ```swift
+   private func sendNextSessionInitializationPacket(to peripheral: CBPeripheral)
+   ```
+
+4. 运行全量测试和 Release 构建，确认通过
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache swift test --disable-sandbox --scratch-path /tmp/afu-scale-build
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache swift build --disable-sandbox --scratch-path /tmp/afu-scale-release -c release
+   ```
+
+5. 实机双记录、隐私检查和代码审查通过后提交
+
+   ```bash
+   git add Sources/AFUReader/BluetoothReader.swift docs/plan_history_sync.mdc
+   git commit -m "fix: complete scale session initialization"
+   ```
+
+## 实现任务
+
+1. 在 AFUCore 实现无 CoreBluetooth 依赖的广播元数据解析器与 D0 编码器；年龄按发送当天和配置生日计算，时间戳使用 UInt32 大端，时区使用 15 分钟单位的二进制补码。
+2. 在 BluetoothReader 匹配广播时保存协议元数据；macOS 未提供或无法识别 manufacturer data 时，只对已经通过 AFU-WL 名称筛选的设备采用参考 subtype 7 连接值 `0x27`；连接状态重置时清除元数据；FFB2 通知就绪后构造 D1/D0 双轮队列，并在支持时采用 `.withResponse` 串行推进。
+3. 删除固定 `FD37` 握手及其重试状态；D1/D0 写入日志仅输出命令类型和“已发送/已确认/已跳过/失败/完成”，不输出配置字段、设备标识或字节内容。
+4. 为 `StableMeasurement` 与 `MeasurementSignature` 增加默认值为 `received` 的时间来源；D8 标记为 `device`，D6/D5 保持 `received`。
+5. 更新 Markdown/JSON 的不可见持久化元数据并提供缺省解码，保证现有用户文件无需迁移即可继续追加。
+
+## 实机 D8 重复诊断任务
+
+**文件**：修改 `Tests/AFUCoreTests/AFUPacketTests.swift`、`Sources/AFUCore/AFUPacket.swift`、`Sources/AFUReader/BluetoothReader.swift`
+
+1. 在合成 D8 测试中先断言历史类型字段可见；运行 `swift test --filter AFUPacketTests`，确认实现前编译或断言失败。
+2. 在 `AFUPacket` 暴露不含健康信息的 `historyType`，D5、D6 和旧短帧返回空值，D8 返回原始协议类型字节。
+3. 在蓝牙读取层仅于内存保存当前连接上一条 D8，用布尔值记录本条与上一条的完整载荷及设备时间是否相同；日志只写 history type、剩余数量、`repeated_payload` 和 `repeated_device_time`，不写时间、体重、阻抗、设备标识或原始字节。
+4. 重新安装并唤醒一次秤：若三个 D8 的两个重复标志均为真，则证明设备只重发一个库存结果；若载荷不同但设备时间相同，则继续修正 D8 字段映射。
+
+验证命令：
+
+```bash
+CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache \
+SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache \
+swift test --disable-sandbox --scratch-path /tmp/afu-scale-build \
+  --filter AFUPacketTests
+```
+
+## 验证与提交
+
+1. 全量单元测试和 Release 构建：
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache \
+   SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache \
+   swift test --disable-sandbox --scratch-path /tmp/afu-scale-build
+
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache \
+   SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache \
+   swift build --disable-sandbox --scratch-path /tmp/afu-scale-release -c release
+
+   bash scripts/check-public-repo.sh
+   ```
+
+2. 安装一次修复版后，从秤休眠状态验证：日志出现 D1/D0/D1/D0 四个成功写入事件；若秤内有两条库存记录，应收到两个具有不同设备时间的 D8，并在输出中新增两条；任何相同 D8 重发均不增加行数。
+3. 验证日志与仓库中不含体重、阻抗、生日、输出路径、设备标识或原始 BLE 帧。
+4. 验证通过后提交：
+
+   ```bash
+   git add Sources Tests docs/plan_history_sync.mdc
+   git commit -m "fix: sync stored scale measurements"
+   ```
+
+## 验收标准
+
+- 最近“两次称重未读取”的直接原因由日志事件计数与协议差异共同解释。
+- D1、D0 编码与厂商 SDK 合成参考帧逐字段一致，且使用广播解析出的协议 deviceType。
+- 两条不同秤内时间的有效 D8 各保存一条，即使体重和 ADC 相同且间隔不足 120 秒。
+- 同一 D8 重发、同一实时/最终结果重发仍只保存一次。
+- 旧 Markdown 和 JSON 文件可直接继续使用。
+- 全量测试、Release 构建、公开仓库隐私检查和真实设备双历史记录验收全部通过。
+
+## 当前实机证据与受控双记录验收
+
+- 单 D0 已由 FFB1 写入回调确认；真实设备随后通常在每次连接中发送 3 个 type 1 D8，然后由 CoreBluetooth 报连接超时。脱敏序列诊断证明同一连接的第二、第三个 D8 与第一个完整载荷和设备时间相同。
+- 受控离线称重已完成，但现有初始化在 38 次完整连接中仍未保存新记录；37 次会话由链路超时结束，程序自己的通知订阅超时在订阅成功后已取消。
+- 官方 worker 不确认 D8；真正缺失的是每次连接的 D1 用户列表以及第二轮 D1/D0。因此本轮不增加未经证实的历史确认命令，而是复现厂商初始化顺序。
+- 受控验收要求：旧库存重发不新增行，两条新 D8 具有不同设备时间并各新增一行，每条自身的重复帧均被抑制，输出总行数净增 2。

@@ -23,7 +23,10 @@ public struct JSONStore: Sendable {
         try prepareManagedFiles()
         var document = try readDocument()
         let deduplicator = MeasurementDeduplicator(window: deduplicationWindow)
-        if deduplicator.isDuplicate(record.measurement.signature, comparedWith: document.measurements.last?.signature) {
+        if deduplicator.isDuplicate(
+            record.measurement.signature,
+            comparedWith: document.measurements.map(\.signature)
+        ) {
             return false
         }
 
@@ -64,6 +67,14 @@ public struct JSONStore: Sendable {
 
         try SecureFile.write(canonicalData, to: fileURL)
         return true
+    }
+
+    public func latestWeightKilograms() throws -> Double? {
+        let sourceURL = canonicalFileURL ?? fileURL
+        guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+            return nil
+        }
+        return try readDocument().measurements.last?.weightKilograms
     }
 
     private func prepareManagedFiles() throws {
@@ -125,6 +136,7 @@ private struct JSONMeasurement: Codable {
     let measuredAt: Date
     let weightKilograms: Double
     let impedanceRawCode: Int?
+    let timeSource: MeasurementTimeSource?
     let algorithm: String
     let mode: String
     let bmi: Double
@@ -150,6 +162,7 @@ private struct JSONMeasurement: Codable {
         measuredAt = measurement.measuredAt
         weightKilograms = measurement.weightKilograms
         impedanceRawCode = measurement.impedanceRawCode
+        timeSource = measurement.timeSource
         algorithm = composition.algorithmVersion
         mode = composition.mode.rawValue
         bmi = composition.bmi
@@ -175,7 +188,8 @@ private struct JSONMeasurement: Codable {
             measuredAt: measuredAt,
             weightKilograms: weightKilograms,
             impedanceRawCode: impedanceRawCode,
-            deviceName: ""
+            deviceName: "",
+            timeSource: timeSource ?? .received
         )
     }
 
@@ -183,6 +197,7 @@ private struct JSONMeasurement: Codable {
         case measuredAt = "measured_at"
         case weightKilograms = "weight_kg"
         case impedanceRawCode = "impedance_raw"
+        case timeSource = "time_source"
         case algorithm
         case mode
         case bmi

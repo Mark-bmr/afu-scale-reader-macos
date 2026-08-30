@@ -42,4 +42,13 @@ public enum MeasurementStore: Sendable {
             return try store.restoreOutputFromCanonicalIfNeeded()
         }
     }
+
+    public func latestWeightKilograms() throws -> Double? {
+        switch self {
+        case let .markdown(store):
+            return try store.latestWeightKilograms()
+        case let .json(store):
+            return try store.latestWeightKilograms()
+        }
+    }
 }

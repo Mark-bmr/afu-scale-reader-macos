@@ -316,7 +316,7 @@ final class MeasurementDeduplicatorTests: XCTestCase {
         var tracker = MeasurementSessionTracker(settleInterval: 2)
         let deduplicator = MeasurementDeduplicator(window: 120)
         let firstTimestamp: UInt32 = 1_600_000_000
-        let secondTimestamp = firstTimestamp + 300
+        let secondTimestamp = firstTimestamp + 60
 
         let first = try XCTUnwrap(tracker.receiveFinalResult(
             try historyPacket(weight: 70, impedance: 700, timestamp: firstTimestamp),
@@ -331,7 +331,29 @@ final class MeasurementDeduplicatorTests: XCTestCase {
 
         XCTAssertEqual(first.measuredAt, Date(timeIntervalSince1970: TimeInterval(firstTimestamp)))
         XCTAssertEqual(second.measuredAt, Date(timeIntervalSince1970: TimeInterval(secondTimestamp)))
+        XCTAssertEqual(first.timeSource, .device)
+        XCTAssertEqual(second.timeSource, .device)
         XCTAssertFalse(deduplicator.isDuplicate(second.signature, comparedWith: first.signature))
+    }
+
+    func testRepeatedSyntheticD8WithSameDeviceTimeIsDuplicate() throws {
+        var tracker = MeasurementSessionTracker(settleInterval: 2)
+        let deduplicator = MeasurementDeduplicator(window: 120)
+        let timestamp: UInt32 = 1_600_000_000
+        let packet = try historyPacket(weight: 70, impedance: 700, timestamp: timestamp)
+
+        let first = try XCTUnwrap(tracker.receiveFinalResult(
+            packet,
+            at: Date(timeIntervalSince1970: 4_000),
+            deviceName: "AFU-WL-TZ-A1"
+        ))
+        let repeated = try XCTUnwrap(tracker.receiveFinalResult(
+            packet,
+            at: Date(timeIntervalSince1970: 4_001),
+            deviceName: "AFU-WL-TZ-A1"
+        ))
+
+        XCTAssertTrue(deduplicator.isDuplicate(repeated.signature, comparedWith: first.signature))
     }
 
     func testWaitsForMissingImpedanceThenFlushesWeight() throws {

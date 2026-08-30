@@ -39,7 +39,7 @@ public struct MarkdownStore: Sendable {
         try prepareManagedFiles()
         let existingText = try readExistingText()
         let deduplicator = MeasurementDeduplicator(window: deduplicationWindow)
-        if deduplicator.isDuplicate(record.measurement.signature, comparedWith: lastSignature(in: existingText)) {
+        if deduplicator.isDuplicate(record.measurement.signature, comparedWith: signatures(in: existingText)) {
             return false
         }
 
@@ -89,6 +89,15 @@ public struct MarkdownStore: Sendable {
         return true
     }
 
+    public func latestWeightKilograms() throws -> Double? {
+        let sourceURL = canonicalFileURL ?? fileURL
+        guard FileManager.default.fileExists(atPath: sourceURL.path) else {
+            return nil
+        }
+        let text = try String(contentsOf: sourceURL, encoding: .utf8)
+        return signatures(in: text).last?.weightKilograms
+    }
+
     private func prepareManagedFiles() throws {
         if let canonicalFileURL {
             try ManagedOutput.initialize(
@@ -109,11 +118,12 @@ public struct MarkdownStore: Sendable {
         return try String(contentsOf: fileURL, encoding: .utf8)
     }
 
-    private func lastSignature(in text: String) -> MeasurementSignature? {
+    private func signatures(in text: String) -> [MeasurementSignature] {
         let prefix = "<!-- afu-meta: "
         let suffix = " -->"
+        var signatures: [MeasurementSignature] = []
 
-        for line in text.split(separator: "\n", omittingEmptySubsequences: false).reversed() {
+        for line in text.split(separator: "\n", omittingEmptySubsequences: false) {
             let value = String(line)
             guard let startRange = value.range(of: prefix, options: .backwards) else { continue }
             let remainder = value[startRange.upperBound...]
@@ -127,9 +137,9 @@ public struct MarkdownStore: Sendable {
             else {
                 continue
             }
-            return metadata.signature
+            signatures.append(metadata.signature)
         }
-        return nil
+        return signatures
     }
 
     private func containsTableHeader(in text: String) -> Bool {
@@ -156,7 +166,8 @@ public struct MarkdownStore: Sendable {
             impedanceRawCode: measurement.impedanceRawCode,
             algorithm: composition.algorithmVersion,
             mode: composition.mode.rawValue,
-            storeID: storeID.uuidString.lowercased()
+            storeID: storeID.uuidString.lowercased(),
+            timeSource: measurement.timeSource
         )
 
         let encoder = JSONEncoder()
@@ -220,13 +231,15 @@ private struct MarkdownMetadata: Codable {
     let algorithm: String
     let mode: String
     let storeID: String
+    let timeSource: MeasurementTimeSource?
 
     var signature: MeasurementSignature {
         MeasurementSignature(
             measuredAt: measuredAt,
             weightKilograms: weightKilograms,
             impedanceRawCode: impedanceRawCode,
-            deviceName: ""
+            deviceName: "",
+            timeSource: timeSource ?? .received
         )
     }
 
@@ -237,5 +250,6 @@ private struct MarkdownMetadata: Codable {
         case algorithm
         case mode
         case storeID = "store_id"
+        case timeSource = "time_source"
     }
 }

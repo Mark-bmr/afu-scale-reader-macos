@@ -20,6 +20,7 @@ final class AFUPacketTests: XCTestCase {
         XCTAssertNil(packet.impedanceRawCode)
         XCTAssertNil(packet.measuredAt)
         XCTAssertNil(packet.remainingHistoryCount)
+        XCTAssertNil(packet.historyType)
     }
 
     func testD5StableFlagDoesNotComeFromModeByte() throws {
@@ -50,6 +51,7 @@ final class AFUPacketTests: XCTestCase {
         XCTAssertEqual(packet.impedanceRawCode, 710)
         XCTAssertNil(packet.measuredAt)
         XCTAssertNil(packet.remainingHistoryCount)
+        XCTAssertNil(packet.historyType)
     }
 
     func testParsesSyntheticD8HistoryWithDeviceTime() throws {
@@ -72,6 +74,7 @@ final class AFUPacketTests: XCTestCase {
         XCTAssertEqual(packet.impedanceRawCode, 705)
         XCTAssertEqual(packet.measuredAt, Date(timeIntervalSince1970: TimeInterval(timestamp)))
         XCTAssertEqual(packet.remainingHistoryCount, 2)
+        XCTAssertEqual(packet.historyType, 2)
     }
 
     func testParsesSyntheticStablePacket() throws {

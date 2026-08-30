@@ -7,7 +7,6 @@ final class BluetoothReader: NSObject {
     private let serviceUUID = CBUUID(string: "0000FFB0-0000-1000-8000-00805F9B34FB")
     private let writeUUID = CBUUID(string: "0000FFB1-0000-1000-8000-00805F9B34FB")
     private let notifyUUID = CBUUID(string: "0000FFB2-0000-1000-8000-00805F9B34FB")
-    private let handshake = Data([0xFD, 0x37, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x37])
 
     private let configuration: ReaderConfiguration
     private let measurementStore: MeasurementStore
@@ -16,8 +15,13 @@ final class BluetoothReader: NSObject {
     private var lifecycle = BluetoothLifecycle()
     private var central: CBCentralManager?
     private var activePeripheral: CBPeripheral?
+    private var activeProtocolMetadata: AFUAdvertisementProtocolMetadata?
     private var writeCharacteristic: CBCharacteristic?
     private var notifyCharacteristic: CBCharacteristic?
+    private var pendingSessionInitializationPackets: [Data] = []
+    private var inFlightSessionCommand: UInt8?
+    private var previousHistoryPayload: Data?
+    private var previousHistoryMeasuredAt: Date?
     private var setupTimeoutTimer: Timer?
     private var retryTimer: Timer?
     private var flushTimer: Timer?
@@ -25,7 +29,6 @@ final class BluetoothReader: NSObject {
     private var persistenceRetryTimer: Timer?
     private var markdownReconciliationTimer: Timer?
     private var persistenceQueue: [StableMeasurement] = []
-    private var handshakeFallbackAttempted = false
     private var shouldRun = false
 
     init(configuration: ReaderConfiguration, logger: RotatingFileLogger) {
@@ -83,14 +86,48 @@ final class BluetoothReader: NSObject {
         )
     }
 
-    private func connect(to peripheral: CBPeripheral, name: String) {
+    private func protocolMetadata(
+        from advertisementData: [String: Any]
+    ) -> AFUAdvertisementProtocolMetadata? {
+        guard let manufacturerData = advertisementData[CBAdvertisementDataManufacturerDataKey] as? Data else {
+            log("Matched scale advertisement has no manufacturer data")
+            return nil
+        }
+
+        do {
+            return try AFUAdvertisementProtocolMetadata(manufacturerData: manufacturerData)
+        } catch let error as AFUSessionProfileError {
+            switch error {
+            case let .advertisementTooShort(actual):
+                log("Matched scale manufacturer data is too short: bytes=\(actual)")
+            case .invalidManufacturerMagic:
+                log("Matched scale manufacturer data has an unexpected identifier")
+            case let .unsupportedScale(category, subtype):
+                log("Matched scale protocol is not recognized: category=\(category) subtype=\(subtype)")
+            default:
+                log("Matched scale protocol metadata could not be decoded")
+            }
+            return nil
+        } catch {
+            log("Matched scale protocol metadata could not be decoded")
+            return nil
+        }
+    }
+
+    private func connect(
+        to peripheral: CBPeripheral,
+        name: String,
+        protocolMetadata: AFUAdvertisementProtocolMetadata?
+    ) {
         guard let central, activePeripheral == nil else { return }
         central.stopScan()
         activePeripheral = peripheral
+        activeProtocolMetadata = protocolMetadata
         lifecycle.connectionStarted()
         writeCharacteristic = nil
         notifyCharacteristic = nil
-        handshakeFallbackAttempted = false
+        previousHistoryPayload = nil
+        previousHistoryMeasuredAt = nil
         peripheral.delegate = self
         log("Connecting to matched scale named \(name)")
         central.connect(peripheral, options: nil)
@@ -175,20 +212,78 @@ final class BluetoothReader: NSObject {
         }
     }
 
-    private func sendHandshake(to peripheral: CBPeripheral) {
+    private func sendSessionInitialization(to peripheral: CBPeripheral) {
         guard let writeCharacteristic else {
-            log("FFB1 write characteristic is missing; notifications remain enabled")
+            log("AFU session initialization skipped because FFB1 is missing")
+            return
+        }
+        if activeProtocolMetadata == nil {
+            log("Using AFU subtype 7 compatibility session initialization")
+        }
+        let deviceType = AFUSessionDeviceType.resolved(from: activeProtocolMetadata)
+        let fallbackWeightKilograms = 60.0
+        let currentWeightKilograms: Double
+        do {
+            currentWeightKilograms = try measurementStore.latestWeightKilograms()
+                ?? fallbackWeightKilograms
+        } catch {
+            currentWeightKilograms = fallbackWeightKilograms
+            log("AFU session user weight unavailable; using local fallback")
+        }
+
+        do {
+            pendingSessionInitializationPackets = try AFUSessionInitializationPackets.encode(
+                deviceType: deviceType,
+                profile: configuration.profile,
+                currentWeightKilograms: currentWeightKilograms
+            )
+        } catch {
+            errorEvent("AFU session initialization could not be encoded")
+            return
+        }
+        inFlightSessionCommand = nil
+        info("AFU session initialization started")
+        sendNextSessionInitializationPacket(to: peripheral, characteristic: writeCharacteristic)
+    }
+
+    private func sendNextSessionInitializationPacket(
+        to peripheral: CBPeripheral,
+        characteristic: CBCharacteristic
+    ) {
+        guard !pendingSessionInitializationPackets.isEmpty else {
+            inFlightSessionCommand = nil
+            info("AFU session initialization completed")
             return
         }
 
-        if writeCharacteristic.properties.contains(.write) {
-            log("Sending AFU handshake to FFB1 with response")
-            peripheral.writeValue(handshake, for: writeCharacteristic, type: .withResponse)
-        } else if writeCharacteristic.properties.contains(.writeWithoutResponse) {
-            log("Sending AFU handshake to FFB1 without response")
-            peripheral.writeValue(handshake, for: writeCharacteristic, type: .withoutResponse)
-        } else {
-            log("FFB1 does not advertise a supported write property")
+        if characteristic.properties.contains(.write) {
+            guard inFlightSessionCommand == nil else { return }
+            let packet = pendingSessionInitializationPackets.removeFirst()
+            inFlightSessionCommand = packet[18]
+            log("Sending AFU session command=\(sessionCommandLabel(packet[18])) with response")
+            peripheral.writeValue(packet, for: characteristic, type: .withResponse)
+            return
+        }
+
+        guard characteristic.properties.contains(.writeWithoutResponse) else {
+            pendingSessionInitializationPackets.removeAll()
+            log("AFU session initialization skipped because FFB1 is not writable")
+            return
+        }
+
+        while !pendingSessionInitializationPackets.isEmpty {
+            let packet = pendingSessionInitializationPackets.removeFirst()
+            peripheral.writeValue(packet, for: characteristic, type: .withoutResponse)
+            info("AFU session command sent command=\(sessionCommandLabel(packet[18]))")
+        }
+        info("AFU session initialization completed")
+    }
+
+    private func sessionCommandLabel(_ command: UInt8) -> String {
+        switch command {
+        case 0xD0: "D0"
+        case 0xD1: "D1"
+        default: "unknown"
         }
     }
 
@@ -203,10 +298,26 @@ final class BluetoothReader: NSObject {
                 cancelInterruptedSessionFlush()
                 if packet.kind == .history {
                     info("Historical measurement result received")
+                    let hasPreviousHistory = previousHistoryPayload != nil
+                    let repeatedPayload = previousHistoryPayload.map { $0 == data } ?? false
+                    let repeatedDeviceTime: Bool
+                    if let previousHistoryMeasuredAt, let measuredAt = packet.measuredAt {
+                        repeatedDeviceTime = previousHistoryMeasuredAt == measuredAt
+                    } else {
+                        repeatedDeviceTime = false
+                    }
                     log(
-                        "History result detail remaining_count="
+                        "History result detail type="
+                            + (packet.historyType.map(String.init) ?? "unknown")
+                            + " remaining_count="
                             + (packet.remainingHistoryCount.map(String.init) ?? "unknown")
+                            + " repeated_payload="
+                            + (hasPreviousHistory ? (repeatedPayload ? "yes" : "no") : "first")
+                            + " repeated_device_time="
+                            + (hasPreviousHistory ? (repeatedDeviceTime ? "yes" : "no") : "first")
                     )
+                    previousHistoryPayload = data
+                    previousHistoryMeasuredAt = packet.measuredAt
                 } else {
                     info("Final measurement result received")
                 }
@@ -346,8 +457,12 @@ final class BluetoothReader: NSObject {
         setupTimeoutTimer = nil
         writeCharacteristic = nil
         notifyCharacteristic = nil
+        pendingSessionInitializationPackets.removeAll()
+        inFlightSessionCommand = nil
+        previousHistoryPayload = nil
+        previousHistoryMeasuredAt = nil
         activePeripheral = nil
-        handshakeFallbackAttempted = false
+        activeProtocolMetadata = nil
         lifecycle.connectionEnded()
     }
 
@@ -426,8 +541,12 @@ extension BluetoothReader: @preconcurrency CBCentralManagerDelegate {
         }
         let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
         let name = peripheral.name ?? advertisedName ?? "AFU scale"
+        let metadata = protocolMetadata(from: advertisementData)
+        if metadata == nil {
+            log("Matched scale lacks supported AFU protocol metadata")
+        }
         log("Matched \(name), RSSI=\(RSSI)")
-        connect(to: peripheral, name: name)
+        connect(to: peripheral, name: name, protocolMetadata: metadata)
     }
 
     func centralManager(_ central: CBCentralManager, didConnect peripheral: CBPeripheral) {
@@ -529,7 +648,7 @@ extension BluetoothReader: @preconcurrency CBPeripheralDelegate {
         }
         setupTimeoutTimer?.invalidate()
         log("FFB2 notifications enabled")
-        sendHandshake(to: peripheral)
+        sendSessionInitialization(to: peripheral)
     }
 
     func peripheral(
@@ -538,18 +657,24 @@ extension BluetoothReader: @preconcurrency CBPeripheralDelegate {
         error: Error?
     ) {
         guard characteristic.uuid == writeUUID else { return }
+        let command = inFlightSessionCommand
+        inFlightSessionCommand = nil
         guard let error else {
-            log("AFU handshake acknowledged")
+            info("AFU session command acknowledged command=\(sessionCommandLabel(command ?? 0))")
+            if let writeCharacteristic {
+                sendNextSessionInitializationPacket(
+                    to: peripheral,
+                    characteristic: writeCharacteristic
+                )
+            }
             return
         }
-
-        if characteristic.properties.contains(.writeWithoutResponse), !handshakeFallbackAttempted {
-            handshakeFallbackAttempted = true
-            log("Handshake with response failed; retrying without response: \(error.localizedDescription)")
-            peripheral.writeValue(handshake, for: characteristic, type: .withoutResponse)
-        } else {
-            log("AFU handshake failed: \(error.localizedDescription)")
-        }
+        pendingSessionInitializationPackets.removeAll()
+        log(
+            "AFU session command write failed command="
+                + sessionCommandLabel(command ?? 0)
+                + ": \(error.localizedDescription)"
+        )
     }
 
     func peripheral(

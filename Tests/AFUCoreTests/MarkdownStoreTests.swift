@@ -95,6 +95,75 @@ final class MarkdownStoreTests: XCTestCase {
         XCTAssertEqual(measurementRows(in: text).count, 2)
     }
 
+    func testPersistsDistinctDeviceTimesInsideReceivedDeduplicationWindow() throws {
+        let store = MarkdownStore(
+            fileURL: fileURL,
+            storeID: storeID,
+            deduplicationWindow: 120,
+            timeZone: TimeZone(secondsFromGMT: 0)!
+        )
+        let first = date("2026-08-19T08:30:12Z")
+        let second = date("2026-08-19T08:31:12Z")
+
+        XCTAssertTrue(try store.append(record(at: first, timeSource: .device)))
+        XCTAssertTrue(try store.append(record(at: second, timeSource: .device)))
+
+        let restarted = MarkdownStore(
+            fileURL: fileURL,
+            storeID: storeID,
+            deduplicationWindow: 120,
+            timeZone: TimeZone(secondsFromGMT: 0)!
+        )
+        XCTAssertFalse(try restarted.append(record(at: second, timeSource: .device)))
+        XCTAssertEqual(
+            measurementRows(in: try String(contentsOf: fileURL, encoding: .utf8)).count,
+            2
+        )
+    }
+
+    func testSuppressesReplayedDeviceHistoryBatchAfterRestart() throws {
+        let store = MarkdownStore(fileURL: fileURL, storeID: storeID, timeZone: TimeZone(secondsFromGMT: 0)!)
+        let first = date("2026-08-19T08:30:12Z")
+        let second = date("2026-08-19T12:30:12Z")
+        XCTAssertTrue(try store.append(record(at: first, timeSource: .device)))
+        XCTAssertTrue(try store.append(record(at: second, timeSource: .device)))
+
+        let restarted = MarkdownStore(fileURL: fileURL, storeID: storeID, timeZone: TimeZone(secondsFromGMT: 0)!)
+        XCTAssertFalse(try restarted.append(record(at: first, timeSource: .device)))
+        XCTAssertFalse(try restarted.append(record(at: second, timeSource: .device)))
+        XCTAssertEqual(
+            measurementRows(in: try String(contentsOf: fileURL, encoding: .utf8)).count,
+            2
+        )
+    }
+
+    func testLegacyMetadataWithoutTimeSourceStillDecodes() throws {
+        let store = MarkdownStore(fileURL: fileURL, storeID: storeID, timeZone: TimeZone(secondsFromGMT: 0)!)
+        XCTAssertTrue(try store.append(record(at: date("2026-08-19T08:30:12Z"))))
+        try removeTimeSourceFromLastMetadata()
+
+        let restarted = MarkdownStore(fileURL: fileURL, storeID: storeID, timeZone: TimeZone(secondsFromGMT: 0)!)
+        XCTAssertFalse(try restarted.append(record(at: date("2026-08-19T08:31:00Z"))))
+        XCTAssertEqual(
+            measurementRows(in: try String(contentsOf: fileURL, encoding: .utf8)).count,
+            1
+        )
+        XCTAssertEqual(try restarted.latestWeightKilograms(), 70)
+    }
+
+    func testReturnsLatestWeightForSessionUserMatching() throws {
+        let store = MarkdownStore(
+            fileURL: fileURL,
+            storeID: storeID,
+            timeZone: TimeZone(secondsFromGMT: 0)!
+        )
+
+        XCTAssertNil(try store.latestWeightKilograms())
+        XCTAssertTrue(try store.append(record(at: date("2026-08-19T08:30:12Z"), weight: 70)))
+        XCTAssertTrue(try store.append(record(at: date("2026-08-19T08:33:00Z"), weight: 83)))
+        XCTAssertEqual(try store.latestWeightKilograms(), 83)
+    }
+
     func testInlineMetadataCannotBreakTableAndStillDeduplicates() throws {
         let store = MarkdownStore(fileURL: fileURL, storeID: storeID, timeZone: TimeZone(secondsFromGMT: 0)!)
 
@@ -125,9 +194,10 @@ final class MarkdownStoreTests: XCTestCase {
 
         XCTAssertEqual(
             Set(object.keys),
-            ["algorithm", "impedance_raw", "measured_at", "mode", "store_id", "weight_kg"]
+            ["algorithm", "impedance_raw", "measured_at", "mode", "store_id", "time_source", "weight_kg"]
         )
         XCTAssertEqual(object["store_id"] as? String, storeID.uuidString.lowercased())
+        XCTAssertEqual(object["time_source"] as? String, "received")
         XCTAssertFalse(text.contains("AC000069117002000320"))
         XCTAssertFalse(text.contains("AFU-WL-TZ-A1"))
     }
@@ -254,7 +324,8 @@ final class MarkdownStoreTests: XCTestCase {
         at measuredAt: Date,
         weight: Double = 70,
         impedance: Int? = 800,
-        deviceName: String = "AFU-WL-TZ-A1"
+        deviceName: String = "AFU-WL-TZ-A1",
+        timeSource: MeasurementTimeSource = .received
     ) throws -> MeasurementRecord {
         let profile = BodyProfile(
             sex: .male,
@@ -273,10 +344,28 @@ final class MarkdownStoreTests: XCTestCase {
                 weightKilograms: weight,
                 impedanceRawCode: impedance,
                 rawHex: "AC000069117002000320",
-                deviceName: deviceName
+                deviceName: deviceName,
+                timeSource: timeSource
             ),
             composition: composition
         )
+    }
+
+    private func removeTimeSourceFromLastMetadata() throws {
+        var text = try String(contentsOf: fileURL, encoding: .utf8)
+        let prefix = "<!-- afu-meta: "
+        let suffix = " -->"
+        let startRange = try XCTUnwrap(text.range(of: prefix, options: .backwards))
+        let payloadStart = startRange.upperBound
+        let endRange = try XCTUnwrap(text.range(of: suffix, range: payloadStart ..< text.endIndex))
+        let payload = String(text[payloadStart ..< endRange.lowerBound])
+        let data = try XCTUnwrap(Data(base64Encoded: payload))
+        var object = try XCTUnwrap(JSONSerialization.jsonObject(with: data) as? [String: Any])
+        object.removeValue(forKey: "time_source")
+        let legacyPayload = try JSONSerialization.data(withJSONObject: object, options: [.sortedKeys])
+            .base64EncodedString()
+        text.replaceSubrange(payloadStart ..< endRange.lowerBound, with: legacyPayload)
+        try text.write(to: fileURL, atomically: true, encoding: .utf8)
     }
 
     private func date(_ value: String) -> Date {

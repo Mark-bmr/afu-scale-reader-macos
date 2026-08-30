@@ -1,24 +1,32 @@
 import Foundation
 
+public enum MeasurementTimeSource: String, Codable, Equatable, Sendable {
+    case received
+    case device
+}
+
 public struct StableMeasurement: Equatable, Sendable {
     public let measuredAt: Date
     public let weightKilograms: Double
     public let impedanceRawCode: Int?
     public let rawHex: String
     public let deviceName: String
+    public let timeSource: MeasurementTimeSource
 
     public init(
         measuredAt: Date,
         weightKilograms: Double,
         impedanceRawCode: Int?,
         rawHex: String,
-        deviceName: String
+        deviceName: String,
+        timeSource: MeasurementTimeSource = .received
     ) {
         self.measuredAt = measuredAt
         self.weightKilograms = weightKilograms
         self.impedanceRawCode = impedanceRawCode
         self.rawHex = rawHex
         self.deviceName = deviceName
+        self.timeSource = timeSource
     }
 
     public var signature: MeasurementSignature {
@@ -26,7 +34,8 @@ public struct StableMeasurement: Equatable, Sendable {
             measuredAt: measuredAt,
             weightKilograms: weightKilograms,
             impedanceRawCode: impedanceRawCode,
-            deviceName: deviceName
+            deviceName: deviceName,
+            timeSource: timeSource
         )
     }
 }
@@ -36,17 +45,20 @@ public struct MeasurementSignature: Codable, Equatable, Sendable {
     public let weightKilograms: Double
     public let impedanceRawCode: Int?
     public let deviceName: String
+    public let timeSource: MeasurementTimeSource
 
     public init(
         measuredAt: Date,
         weightKilograms: Double,
         impedanceRawCode: Int?,
-        deviceName: String
+        deviceName: String,
+        timeSource: MeasurementTimeSource = .received
     ) {
         self.measuredAt = measuredAt
         self.weightKilograms = weightKilograms
         self.impedanceRawCode = impedanceRawCode
         self.deviceName = deviceName
+        self.timeSource = timeSource
     }
 }
 
@@ -64,10 +76,32 @@ public struct MeasurementDeduplicator: Sendable {
         comparedWith previous: MeasurementSignature?
     ) -> Bool {
         guard let previous else { return false }
-        let elapsed = candidate.measuredAt.timeIntervalSince(previous.measuredAt)
-        guard elapsed >= 0, elapsed <= window else { return false }
         guard candidate.impedanceRawCode == previous.impedanceRawCode else { return false }
-        return abs(candidate.weightKilograms - previous.weightKilograms) <= weightTolerance
+        guard abs(candidate.weightKilograms - previous.weightKilograms) <= weightTolerance else {
+            return false
+        }
+
+        let elapsed = candidate.measuredAt.timeIntervalSince(previous.measuredAt)
+        if candidate.timeSource == .device, previous.timeSource == .device {
+            return elapsed == 0
+        }
+        if candidate.timeSource != previous.timeSource {
+            return abs(elapsed) <= window
+        }
+        return elapsed >= 0 && elapsed <= window
+    }
+
+    public func isDuplicate(
+        _ candidate: MeasurementSignature,
+        comparedWith previous: [MeasurementSignature]
+    ) -> Bool {
+        let comparisons: ArraySlice<MeasurementSignature>
+        if candidate.timeSource == .device {
+            comparisons = previous[...]
+        } else {
+            comparisons = previous.suffix(1)
+        }
+        return comparisons.contains { isDuplicate(candidate, comparedWith: $0) }
     }
 }
 
@@ -196,7 +230,8 @@ public struct MeasurementSessionTracker: Sendable {
             weightKilograms: packet.weightKilograms,
             impedanceRawCode: packet.impedanceRawCode,
             rawHex: packet.rawHex,
-            deviceName: deviceName
+            deviceName: deviceName,
+            timeSource: packet.kind == .history && packet.measuredAt != nil ? .device : .received
         )
     }
 

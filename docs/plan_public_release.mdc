@@ -1,0 +1,88 @@
+# 最新修复发布与 README 整理计划
+
+> **目标**：保存并发布已经完成的体脂秤读取修复，同时把 README 整理为准确、简洁且不含个人隐私或内部排障材料的公开说明。
+> **架构**：不改变运行时代码的数据链路，仅整理公开文档并验证现有实现。使用仓库自带公开检查、Swift 全量测试和 Release 构建作为发布门禁，提交后将已验证提交推送到远端主分支。
+> **技术栈**：Markdown、Swift 6、Swift Package Manager、Git。
+
+---
+
+## 改动范围
+
+| 文件 | 改动类型 | 改动说明 |
+|---|---|---|
+| `README.md` | 修改 | 精简项目介绍、安装使用和输出说明；说明历史记录能力边界；移除健康数值示例、内部实现细节和危险的直接删除命令 |
+| `docs/plan_public_release.mdc` | 新增 | 记录本次公开发布的范围、验证与提交步骤 |
+
+现有 Swift 源码与测试只做审查、测试和提交，不在本次文档整理中改变其行为或接口。
+
+## 数据链路
+
+```text
+秤的 BLE 通知 → AFUPacket 解析 → MeasurementSessionTracker → 去重 → Markdown/JSON
+README → 公开仓库访问者 → 安装、配置、使用和隐私边界说明
+```
+
+README 只描述已经由源码和测试验证的行为。真实测量值、生日、本机路径、设备标识、日志内容、原始 BLE 帧和凭据不会进入公开内容。
+
+## Task 1：整理公开 README
+
+**文件**：修改 `README.md`
+
+1. 记录整理前的 README 差异
+
+   ```bash
+   git diff -- README.md
+   ```
+
+2. 运行公开仓库检查并保存基线结果
+
+   ```bash
+   bash scripts/check-public-repo.sh
+   ```
+
+3. 以最小改动重写 README：保留安装、使用、权限、输出、隐私、卸载和开发入口；删除具体健康数值示例、内部存储实现说明和直接递归删除命令；明确程序会保存秤实际发送的不同历史记录，但不承诺设备固件提供全部库存记录。
+
+4. 运行文档和隐私检查
+
+   ```bash
+   bash scripts/check-public-repo.sh
+   git diff --check
+   ```
+
+5. 与已经验证的源码和测试一起提交
+
+   ```bash
+   git add README.md docs/plan_public_release.mdc Sources Tests docs/plan_history_sync.mdc
+   git commit -m "fix: sync scale history records"
+   ```
+
+## 测试策略与验证方式
+
+1. 全量测试：
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache swift test --disable-sandbox --scratch-path /tmp/afu-scale-build
+   ```
+
+2. Release 构建：
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache swift build --disable-sandbox --scratch-path /tmp/afu-scale-release -c release
+   ```
+
+3. 发布门禁：公开仓库检查通过、Git 差异无空白错误、仓库中不存在运行时配置/测量输出/日志/个人路径/邮箱/凭据。
+4. 提交后验证提交内容和远端更新：
+
+   ```bash
+   git show --stat --oneline HEAD
+   git push origin HEAD:main
+   git ls-remote --heads origin main
+   ```
+
+## 验收标准
+
+- README 对安装、后台运行、输出和隐私边界的描述与当前实现一致。
+- README 不包含真实健康数据、个人文件路径、账号邮箱、设备标识、调试日志或原始数据帧。
+- README 不承诺秤固件一定返回全部离线记录。
+- 全量测试、Release 构建和公开仓库检查全部通过。
+- 远端 `main` 指向本次验证后的提交。
