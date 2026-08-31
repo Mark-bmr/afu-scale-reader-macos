@@ -1,0 +1,185 @@
+# 连续实时称重修复 实现计划
+
+> **目标**：连续两次称重时保持同一个 BLE 实时会话，并阻止默认 live 模式把设备历史 D8 记录误写成当前称重。
+> **架构**：保留现有 CoreBluetooth 连接、`MeasurementSessionTracker` 和存储链路；D6 完成后不再由读取器主动断连，让秤自然结束连接。通过 `AFUSessionMode` 的显式历史持久化策略，把 D8 仅路由到 `--sync-history` 模式；把旧版过短的广播静默配置归一到实机验证的安全下限，不新增依赖或后台组件。
+> **技术栈**：Swift 6、CoreBluetooth、Swift Package Manager、XCTest
+
+---
+
+## 改动范围
+
+| 文件 | 改动类型 | 改动说明 | 影响面 |
+|------|----------|----------|--------|
+| `Sources/AFUCore/AFUSessionProfile.swift` | 修改 | 为 `AFUSessionMode` 增加是否持久化历史结果的只读策略 | 不改变初始化包编码和公开配置格式 |
+| `Tests/AFUCoreTests/AFUSessionProfileTests.swift` | 修改 | 锁定 live 拒绝历史结果、history 接受历史结果 | 只影响测试 |
+| `Sources/AFUCore/ReaderConfiguration.swift` | 修改 | 将广播静默期默认值和有效下限设为 45 秒，自动归一旧版 5 秒配置 | 更长的用户配置保持不变；零值仍报错 |
+| `Tests/AFUCoreTests/ReaderConfigurationTests.swift` | 修改 | 覆盖默认 45 秒、旧短值归一和更长显式值 | 只影响测试 |
+| `Sources/AFUReader/BluetoothReader.swift` | 修改 | D6 后保持连接；live 收到 D8 时只记录无测量值的诊断日志并返回 | 改变实时会话生命周期和 D8 路由，不改变 Markdown/JSON 格式 |
+| `config.example.json` | 修改 | 将广播静默示例改为 45 秒 | 新配置不再使用已证实过短的 5 秒值 |
+| `README.md` | 修改 | 说明连续称重保持连接，以及历史记录只由显式同步写入 | 只影响文档 |
+| `docs/plan_consecutive_live_measurements.mdc` | 新增 | 记录本次根因、数据链路、测试和验收命令 | 只影响开发文档 |
+
+明确不修改广播元数据解析、抗阻算法、Markdown 日期格式、配置字段名称和安装脚本；这些模块不是本次两个症状的源头。
+
+## 数据链路
+
+### 默认 live 模式
+
+```text
+秤广播 → BluetoothReader 连接并订阅 FFB2
+→ 写入启用抗阻的 D0
+→ D5 实时体重候选 → D6 最终体重与抗阻
+→ MeasurementSessionTracker.receiveFinalResult（内部回到 idle）
+→ MeasurementStore 去重并写入 Markdown/JSON
+→ 保持当前 GATT 连接
+→ 第二次 D5/D6 复用同一连接并独立写入
+→ 秤自然休眠/断开
+→ 匹配广播持续出现时重置 45 秒静默计时器
+→ 连续 45 秒无广播后才允许下一次唤醒连接
+```
+
+live 模式收到 D8 时的数据链路为：
+
+```text
+D8 → AFUPacket 识别为 history
+→ AFUSessionMode.live.persistsHistoricalMeasurements == false
+→ 记录“live 模式忽略历史结果”的诊断事件
+→ 不进入 historyTracker，不进入 MeasurementStore，不改变 Markdown
+```
+
+### 显式 history 模式
+
+```text
+AFUReader --sync-history → AFUSessionMode.history
+→ D1/D0/D1/D0 → D8
+→ historyTracker.receiveFinalResult
+→ 使用设备时间去重并写入历史记录
+```
+
+连接、解析或持久化失败继续沿用现有错误处理：CoreBluetooth 回调清理连接状态，`AFUPacket` 抛出解析错误并写安全日志，`MeasurementStore` 失败进入现有重试队列。
+
+## Task 1: 锁定会话模式的历史结果策略
+
+**文件**：修改 `Tests/AFUCoreTests/AFUSessionProfileTests.swift`、`Sources/AFUCore/AFUSessionProfile.swift`
+
+1. 编写失败测试
+
+   ```swift
+   func testOnlyHistoryModePersistsHistoricalMeasurements() {
+       XCTAssertFalse(AFUSessionMode.live.persistsHistoricalMeasurements)
+       XCTAssertTrue(AFUSessionMode.history.persistsHistoricalMeasurements)
+   }
+   ```
+
+2. 运行测试，确认失败
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-consecutive-clang SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-consecutive-swift swift test --disable-sandbox --scratch-path /tmp/afu-scale-consecutive-build --filter AFUSessionProfileTests.testOnlyHistoryModePersistsHistoricalMeasurements
+   # 预期输出：FAIL，AFUSessionMode 尚无 persistsHistoricalMeasurements
+   ```
+
+3. 编写最小实现，使测试通过
+
+   ```swift
+   public var persistsHistoricalMeasurements: Bool {
+       self == .history
+   }
+   ```
+
+4. 运行测试，确认通过
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-consecutive-clang SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-consecutive-swift swift test --disable-sandbox --scratch-path /tmp/afu-scale-consecutive-build --filter AFUSessionProfileTests.testOnlyHistoryModePersistsHistoricalMeasurements
+   # 预期输出：PASS
+   ```
+
+5. 提交
+
+   ```bash
+   git add Sources/AFUCore/AFUSessionProfile.swift Tests/AFUCoreTests/AFUSessionProfileTests.swift
+   git commit -m "fix: separate live and historical results"
+   ```
+
+## Task 2: 保持实时连接、应用 D8 分流并阻止空闲重连
+
+**文件**：修改 `Tests/AFUCoreTests/ReaderConfigurationTests.swift`、`Sources/AFUCore/ReaderConfiguration.swift`、`Sources/AFUReader/BluetoothReader.swift`、`config.example.json`、`README.md`
+
+1. 编写失败测试并确认同一连接的既有能力
+
+   ```swift
+   func testNormalizesLegacyShortAdvertisementQuietInterval() throws {
+       let configuration = try loadConfiguration(advertisementQuietSeconds: 5)
+       XCTAssertEqual(configuration.advertisementQuietInterval, 45)
+   }
+   ```
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-consecutive-clang SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-consecutive-swift swift test --disable-sandbox --scratch-path /tmp/afu-scale-consecutive-build --filter ReaderConfigurationTests.testNormalizesLegacyShortAdvertisementQuietInterval
+   # 预期输出：FAIL，旧配置仍保留 5 秒
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-consecutive-clang SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-consecutive-swift swift test --disable-sandbox --scratch-path /tmp/afu-scale-consecutive-build --filter MeasurementDeduplicatorTests.testEachSyntheticD6ResultEmitsDuringOneConnection
+   # 预期输出：PASS，证明 tracker 已支持连续 D6，断连发生在 BluetoothReader
+   ```
+
+2. 对照失败的实机链路
+
+   ```bash
+   rg -n "cancelPeripheralConnection|packet.kind == .history" Sources/AFUReader/BluetoothReader.swift
+   # 预期输出：D6 分支包含主动断连，D8 分支没有 live/history 门控
+   ```
+
+3. 编写最小实现
+
+   ```swift
+   public static let minimumAdvertisementQuietInterval: TimeInterval = 45
+   self.advertisementQuietInterval = max(
+       advertisementQuietInterval,
+       Self.minimumAdvertisementQuietInterval
+   )
+
+   // D6 保存后直接 return，不调用 cancelPeripheralConnection。
+   guard sessionMode.persistsHistoricalMeasurements else {
+       log("Ignoring historical measurement result in live mode")
+       return
+   }
+   ```
+
+   默认值和 `config.example.json` 改为 45 秒；已有小于 45 秒的正数配置加载后归一为 45 秒，大于等于 45 秒的用户值保持不变。README 明确：后台默认会在秤保持连接时接受连续称重；D8 只在 `--sync-history` 下写入。
+
+4. 运行定向测试、全量测试和构建
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-consecutive-clang SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-consecutive-swift swift test --disable-sandbox --scratch-path /tmp/afu-scale-consecutive-build
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-consecutive-release-clang SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-consecutive-release-swift swift build -c release --disable-sandbox --scratch-path /tmp/afu-scale-consecutive-release
+   bash scripts/check-public-repo.sh
+   git diff --check
+   # 预期输出：所有测试、Release 构建、隐私检查和差异检查均成功
+   ```
+
+5. 提交
+
+   ```bash
+   git add Sources/AFUCore/ReaderConfiguration.swift Tests/AFUCoreTests/ReaderConfigurationTests.swift Sources/AFUReader/BluetoothReader.swift config.example.json README.md docs/plan_consecutive_live_measurements.mdc
+   git commit -m "fix: keep live scale sessions connected"
+   ```
+
+## 测试策略
+
+- 新单测锁定 live/history 对 D8 的不同持久化策略。
+- 配置单测锁定默认 45 秒、旧版短值归一和更长用户值保留。
+- 现有 `testEachSyntheticD6ResultEmitsDuringOneConnection` 锁定同一连接连续 D6 的 tracker 行为。
+- 全量 XCTest 验证协议编码、解析、去重、Markdown/JSON 存储和配置没有回归。
+- Release 构建验证 `AFUReader` 的 CoreBluetooth 调用编译成功。
+- 隐私检查确保日志和测试不新增真实体重、抗阻、出生日期、设备标识或原始 BLE 帧。
+- 安装后先确认 LaunchAgent 能启动，再由用户连续称两次进行唯一的硬件验收；硬件验收前不宣称实机链路完成。
+
+## 验证方式
+
+```bash
+CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-consecutive-clang SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-consecutive-swift swift test --disable-sandbox --scratch-path /tmp/afu-scale-consecutive-build
+CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-consecutive-release-clang SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-consecutive-release-swift swift build -c release --disable-sandbox --scratch-path /tmp/afu-scale-consecutive-release
+bash scripts/check-public-repo.sh
+git diff --check
+git status --short
+```
+
+完成标准：默认 live 模式的 D6 分支不存在主动断连；live D8 不进入持久化；history D8 保持原行为；广播静默期有效值不低于 45 秒；所有自动化验证成功；安装前后台读取器保持停止。

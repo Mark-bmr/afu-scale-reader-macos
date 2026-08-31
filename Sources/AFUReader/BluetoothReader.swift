@@ -340,13 +340,17 @@ final class BluetoothReader: NSObject {
                 ) {
                     enqueueForPersistence(measurement)
                 }
-                if sessionMode == .live, let activePeripheral {
-                    central?.cancelPeripheralConnection(activePeripheral)
+                if sessionMode == .live {
+                    log("Live measurement completed; keeping the scale connection open")
                 }
                 return
             }
 
             if packet.kind == .history {
+                guard sessionMode.persistsHistoricalMeasurements else {
+                    log("Ignoring historical measurement result in live mode")
+                    return
+                }
                 info("Historical measurement result received")
                 let hasPreviousHistory = previousHistoryPayload != nil
                 let repeatedPayload = previousHistoryPayload.map { $0 == data } ?? false
