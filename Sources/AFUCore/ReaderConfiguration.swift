@@ -95,6 +95,7 @@ public struct ReaderConfiguration: Equatable, Sendable {
     public let deduplicationWindow: TimeInterval
     public let connectionTimeout: TimeInterval
     public let retryDelay: TimeInterval
+    public let advertisementQuietInterval: TimeInterval
 
     public init(
         deviceNamePrefix: String = "AFU-WL",
@@ -107,7 +108,8 @@ public struct ReaderConfiguration: Equatable, Sendable {
         settleInterval: TimeInterval = 2,
         deduplicationWindow: TimeInterval = 120,
         connectionTimeout: TimeInterval = 8,
-        retryDelay: TimeInterval = 1
+        retryDelay: TimeInterval = 1,
+        advertisementQuietInterval: TimeInterval = 5
     ) {
         self.deviceNamePrefix = deviceNamePrefix
         self.outputFileURL = outputFileURL
@@ -122,6 +124,7 @@ public struct ReaderConfiguration: Equatable, Sendable {
         self.deduplicationWindow = deduplicationWindow
         self.connectionTimeout = connectionTimeout
         self.retryDelay = retryDelay
+        self.advertisementQuietInterval = advertisementQuietInterval
     }
 
     public static func load(
@@ -213,10 +216,12 @@ public struct ReaderConfiguration: Equatable, Sendable {
         let deduplicationWindow = raw.deduplicationSeconds ?? 120
         let connectionTimeout = raw.connectionTimeoutSeconds ?? 8
         let retryDelay = raw.retryDelaySeconds ?? 1
+        let advertisementQuietInterval = raw.advertisementQuietSeconds ?? 5
         try validateInterval(settleInterval, field: "settle_seconds")
         try validateInterval(deduplicationWindow, field: "deduplication_seconds")
         try validateInterval(connectionTimeout, field: "connection_timeout_seconds")
         try validateInterval(retryDelay, field: "retry_delay_seconds")
+        try validateInterval(advertisementQuietInterval, field: "advertisement_quiet_seconds")
 
         let configuration = ReaderConfiguration(
             deviceNamePrefix: deviceNamePrefix,
@@ -229,7 +234,8 @@ public struct ReaderConfiguration: Equatable, Sendable {
             settleInterval: settleInterval,
             deduplicationWindow: deduplicationWindow,
             connectionTimeout: connectionTimeout,
-            retryDelay: retryDelay
+            retryDelay: retryDelay,
+            advertisementQuietInterval: advertisementQuietInterval
         )
         try SecureFile.protect(fileURL)
         return configuration
@@ -249,7 +255,8 @@ public struct ReaderConfiguration: Equatable, Sendable {
             settleSeconds: settleInterval,
             deduplicationSeconds: deduplicationWindow,
             connectionTimeoutSeconds: connectionTimeout,
-            retryDelaySeconds: retryDelay
+            retryDelaySeconds: retryDelay,
+            advertisementQuietSeconds: advertisementQuietInterval
         )
         let encoder = JSONEncoder()
         encoder.outputFormatting = [.prettyPrinted, .sortedKeys, .withoutEscapingSlashes]
@@ -325,6 +332,7 @@ private struct RawConfiguration: Codable {
     let deduplicationSeconds: Double?
     let connectionTimeoutSeconds: Double?
     let retryDelaySeconds: Double?
+    let advertisementQuietSeconds: Double?
 
     enum CodingKeys: String, CodingKey {
         case syntheticExample = "synthetic_example"
@@ -340,5 +348,6 @@ private struct RawConfiguration: Codable {
         case deduplicationSeconds = "deduplication_seconds"
         case connectionTimeoutSeconds = "connection_timeout_seconds"
         case retryDelaySeconds = "retry_delay_seconds"
+        case advertisementQuietSeconds = "advertisement_quiet_seconds"
     }
 }

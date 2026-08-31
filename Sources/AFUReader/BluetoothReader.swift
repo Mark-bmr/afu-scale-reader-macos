@@ -11,7 +11,9 @@ final class BluetoothReader: NSObject {
     private let configuration: ReaderConfiguration
     private let measurementStore: MeasurementStore
     private let logger: RotatingFileLogger
+    private let sessionMode: AFUSessionMode
     private var sessionTracker: MeasurementSessionTracker
+    private var historyTracker: MeasurementSessionTracker
     private var lifecycle = BluetoothLifecycle()
     private var central: CBCentralManager?
     private var activePeripheral: CBPeripheral?
@@ -24,18 +26,26 @@ final class BluetoothReader: NSObject {
     private var previousHistoryMeasuredAt: Date?
     private var setupTimeoutTimer: Timer?
     private var retryTimer: Timer?
+    private var advertisementQuietTimer: Timer?
     private var flushTimer: Timer?
     private var interruptedSessionTimer: Timer?
     private var persistenceRetryTimer: Timer?
     private var markdownReconciliationTimer: Timer?
     private var persistenceQueue: [StableMeasurement] = []
+    private var sessionInitializationAttempted = false
     private var shouldRun = false
 
-    init(configuration: ReaderConfiguration, logger: RotatingFileLogger) {
+    init(
+        configuration: ReaderConfiguration,
+        logger: RotatingFileLogger,
+        sessionMode: AFUSessionMode
+    ) {
         self.configuration = configuration
         self.logger = logger
+        self.sessionMode = sessionMode
         measurementStore = MeasurementStore(configuration: configuration)
         sessionTracker = MeasurementSessionTracker(settleInterval: configuration.settleInterval)
+        historyTracker = MeasurementSessionTracker(settleInterval: configuration.settleInterval)
         super.init()
     }
 
@@ -53,6 +63,7 @@ final class BluetoothReader: NSObject {
         shouldRun = false
         setupTimeoutTimer?.invalidate()
         retryTimer?.invalidate()
+        advertisementQuietTimer?.invalidate()
         flushTimer?.invalidate()
         interruptedSessionTimer?.invalidate()
         persistenceRetryTimer?.invalidate()
@@ -124,8 +135,11 @@ final class BluetoothReader: NSObject {
         activePeripheral = peripheral
         activeProtocolMetadata = protocolMetadata
         lifecycle.connectionStarted()
+        advertisementQuietTimer?.invalidate()
+        advertisementQuietTimer = nil
         writeCharacteristic = nil
         notifyCharacteristic = nil
+        sessionInitializationAttempted = false
         previousHistoryPayload = nil
         previousHistoryMeasuredAt = nil
         peripheral.delegate = self
@@ -169,6 +183,25 @@ final class BluetoothReader: NSObject {
     }
 
     @objc private func retryTimerFired(_: Timer) {
+        startScan()
+    }
+
+    private func restartAdvertisementQuietTimer() {
+        guard shouldRun else { return }
+        advertisementQuietTimer?.invalidate()
+        advertisementQuietTimer = Timer.scheduledTimer(
+            timeInterval: configuration.advertisementQuietInterval,
+            target: self,
+            selector: #selector(advertisementQuietTimerFired(_:)),
+            userInfo: nil,
+            repeats: false
+        )
+    }
+
+    @objc private func advertisementQuietTimerFired(_: Timer) {
+        advertisementQuietTimer = nil
+        lifecycle.advertisementQuietPeriodElapsed()
+        log("Scale advertisement burst ended; waiting for the next wake")
         startScan()
     }
 
@@ -233,6 +266,7 @@ final class BluetoothReader: NSObject {
 
         do {
             pendingSessionInitializationPackets = try AFUSessionInitializationPackets.encode(
+                mode: sessionMode,
                 deviceType: deviceType,
                 profile: configuration.profile,
                 currentWeightKilograms: currentWeightKilograms
@@ -256,10 +290,13 @@ final class BluetoothReader: NSObject {
             return
         }
 
-        if characteristic.properties.contains(.write) {
+        let prefersWriteWithoutResponse = sessionMode == .live
+            && characteristic.properties.contains(.writeWithoutResponse)
+        if !prefersWriteWithoutResponse, characteristic.properties.contains(.write) {
             guard inFlightSessionCommand == nil else { return }
             let packet = pendingSessionInitializationPackets.removeFirst()
             inFlightSessionCommand = packet[18]
+            sessionInitializationAttempted = true
             log("Sending AFU session command=\(sessionCommandLabel(packet[18])) with response")
             peripheral.writeValue(packet, for: characteristic, type: .withResponse)
             return
@@ -273,6 +310,7 @@ final class BluetoothReader: NSObject {
 
         while !pendingSessionInitializationPackets.isEmpty {
             let packet = pendingSessionInitializationPackets.removeFirst()
+            sessionInitializationAttempted = true
             peripheral.writeValue(packet, for: characteristic, type: .withoutResponse)
             info("AFU session command sent command=\(sessionCommandLabel(packet[18]))")
         }
@@ -291,37 +329,46 @@ final class BluetoothReader: NSObject {
         let receivedAt = Date()
         do {
             let packet = try AFUPacket(data: data)
-            let wasWaitingForReconnect = interruptedSessionTimer != nil
-
-            if packet.kind == .finalResult || packet.kind == .history {
+            if packet.kind == .finalResult {
                 flushTimer?.invalidate()
                 cancelInterruptedSessionFlush()
-                if packet.kind == .history {
-                    info("Historical measurement result received")
-                    let hasPreviousHistory = previousHistoryPayload != nil
-                    let repeatedPayload = previousHistoryPayload.map { $0 == data } ?? false
-                    let repeatedDeviceTime: Bool
-                    if let previousHistoryMeasuredAt, let measuredAt = packet.measuredAt {
-                        repeatedDeviceTime = previousHistoryMeasuredAt == measuredAt
-                    } else {
-                        repeatedDeviceTime = false
-                    }
-                    log(
-                        "History result detail type="
-                            + (packet.historyType.map(String.init) ?? "unknown")
-                            + " remaining_count="
-                            + (packet.remainingHistoryCount.map(String.init) ?? "unknown")
-                            + " repeated_payload="
-                            + (hasPreviousHistory ? (repeatedPayload ? "yes" : "no") : "first")
-                            + " repeated_device_time="
-                            + (hasPreviousHistory ? (repeatedDeviceTime ? "yes" : "no") : "first")
-                    )
-                    previousHistoryPayload = data
-                    previousHistoryMeasuredAt = packet.measuredAt
-                } else {
-                    info("Final measurement result received")
-                }
+                info("Final measurement result received")
                 if let measurement = sessionTracker.receiveFinalResult(
+                    packet,
+                    at: receivedAt,
+                    deviceName: deviceName
+                ) {
+                    enqueueForPersistence(measurement)
+                }
+                if sessionMode == .live, let activePeripheral {
+                    central?.cancelPeripheralConnection(activePeripheral)
+                }
+                return
+            }
+
+            if packet.kind == .history {
+                info("Historical measurement result received")
+                let hasPreviousHistory = previousHistoryPayload != nil
+                let repeatedPayload = previousHistoryPayload.map { $0 == data } ?? false
+                let repeatedDeviceTime: Bool
+                if let previousHistoryMeasuredAt, let measuredAt = packet.measuredAt {
+                    repeatedDeviceTime = previousHistoryMeasuredAt == measuredAt
+                } else {
+                    repeatedDeviceTime = false
+                }
+                log(
+                    "History result detail type="
+                        + (packet.historyType.map(String.init) ?? "unknown")
+                        + " remaining_count="
+                        + (packet.remainingHistoryCount.map(String.init) ?? "unknown")
+                        + " repeated_payload="
+                        + (hasPreviousHistory ? (repeatedPayload ? "yes" : "no") : "first")
+                        + " repeated_device_time="
+                        + (hasPreviousHistory ? (repeatedDeviceTime ? "yes" : "no") : "first")
+                )
+                previousHistoryPayload = data
+                previousHistoryMeasuredAt = packet.measuredAt
+                if let measurement = historyTracker.receiveFinalResult(
                     packet,
                     at: receivedAt,
                     deviceName: deviceName
@@ -331,6 +378,7 @@ final class BluetoothReader: NSObject {
                 return
             }
 
+            let wasWaitingForReconnect = interruptedSessionTimer != nil
             log(
                 String(
                     format: "Packet detail weight_kg=%.2f stable=%@ impedance_raw=%@",
@@ -452,7 +500,7 @@ final class BluetoothReader: NSObject {
         }
     }
 
-    private func resetConnectionState() {
+    private func resetConnectionState(waitForFreshAdvertisement: Bool = false) {
         setupTimeoutTimer?.invalidate()
         setupTimeoutTimer = nil
         writeCharacteristic = nil
@@ -463,12 +511,15 @@ final class BluetoothReader: NSObject {
         previousHistoryMeasuredAt = nil
         activePeripheral = nil
         activeProtocolMetadata = nil
-        lifecycle.connectionEnded()
+        sessionInitializationAttempted = false
+        lifecycle.connectionEnded(waitForFreshAdvertisement: waitForFreshAdvertisement)
     }
 
     private func prepareForUnavailableBluetooth() {
         let hadActivePeripheral = activePeripheral != nil
         retryTimer?.invalidate()
+        advertisementQuietTimer?.invalidate()
+        advertisementQuietTimer = nil
         flushTimer?.invalidate()
         cancelInterruptedSessionFlush()
         central?.stopScan()
@@ -539,6 +590,12 @@ extension BluetoothReader: @preconcurrency CBCentralManagerDelegate {
         guard matchesScale(peripheral: peripheral, advertisementData: advertisementData) else {
             return
         }
+        guard lifecycle.shouldConnectToAdvertisement else {
+            if lifecycle.shouldScan {
+                restartAdvertisementQuietTimer()
+            }
+            return
+        }
         let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
         let name = peripheral.name ?? advertisedName ?? "AFU scale"
         let metadata = protocolMetadata(from: advertisementData)
@@ -583,7 +640,12 @@ extension BluetoothReader: @preconcurrency CBCentralManagerDelegate {
         }
         flushTimer?.invalidate()
         log("Disconnected: \(error?.localizedDescription ?? "scale is idle")")
-        resetConnectionState()
+        let waitForFreshAdvertisement = sessionInitializationAttempted
+            && !sessionTracker.isAwaitingFinalResult
+        resetConnectionState(waitForFreshAdvertisement: waitForFreshAdvertisement)
+        if waitForFreshAdvertisement {
+            restartAdvertisementQuietTimer()
+        }
         scheduleScanRetry()
     }
 }

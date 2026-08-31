@@ -81,6 +81,11 @@ public enum AFUSessionDeviceType {
     }
 }
 
+public enum AFUSessionMode: Equatable, Sendable {
+    case live
+    case history
+}
+
 public enum AFUSessionProfilePacket {
     public static func encode(
         deviceType: UInt8,
@@ -165,18 +170,13 @@ public enum AFUSessionUserPacket {
 
 public enum AFUSessionInitializationPackets {
     public static func encode(
+        mode: AFUSessionMode,
         deviceType: UInt8,
         profile: BodyProfile,
         currentWeightKilograms: Double = 60,
         at date: Date = Date(),
         timeZone: TimeZone = .current
     ) throws -> [Data] {
-        let userPacket = try AFUSessionUserPacket.encode(
-            deviceType: deviceType,
-            profile: profile,
-            currentWeightKilograms: currentWeightKilograms,
-            at: date
-        )
         let profilePacket = try AFUSessionProfilePacket.encode(
             deviceType: deviceType,
             profile: profile,
@@ -184,6 +184,14 @@ public enum AFUSessionInitializationPackets {
             targetWeightKilograms: currentWeightKilograms,
             at: date,
             timeZone: timeZone
+        )
+        guard mode == .history else { return [profilePacket] }
+
+        let userPacket = try AFUSessionUserPacket.encode(
+            deviceType: deviceType,
+            profile: profile,
+            currentWeightKilograms: currentWeightKilograms,
+            at: date
         )
         return [userPacket, profilePacket, userPacket, profilePacket]
     }

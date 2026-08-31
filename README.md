@@ -9,6 +9,7 @@ AFU Scale Reader 是一个原生 macOS 后台读取器，用于连接兼容的�
 ## 功能与边界
 
 - 自动发现并连接名称以 `AFU-WL` 开头的兼容设备。
+- 默认实时会话在订阅通知后发送一次启用抗阻功能的 D0 配置，不依赖厂商 App 保持绑定。
 - 在后台等待稳定测量，并保存体重、测量时间和体成分估算结果。
 - 支持 Markdown 表格和结构化 JSON 输出。
 - 使用秤内时间区分历史记录，并抑制同一记录的重复上报。
@@ -91,6 +92,23 @@ tail -f "$HOME/Library/Application Support/AFUScaleReader/AFUScaleReader.log"
 ```
 
 普通日志不会记录健康数值、文件路径、设备标识或原始蓝牙数据。debug 日志可能包含敏感排障信息，不要直接上传到公开 Issue。
+
+### 手动同步秤内历史
+
+历史握手与实时称重分开，避免后台读取器在每次称重时反复请求旧记录。需要同步秤内历史时，先停止后台任务，再以前台模式运行：
+
+```bash
+launchctl bootout "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/io.github.mark-bmr.afuscalereader.plist" 2>/dev/null || true
+"$HOME/Applications/AFU Scale Reader.app/Contents/MacOS/AFUReader" --sync-history
+```
+
+完成后按 `Control-C` 退出，并恢复后台实时读取器：
+
+```bash
+launchctl bootstrap "gui/$(id -u)" \
+  "$HOME/Library/LaunchAgents/io.github.mark-bmr.afuscalereader.plist"
+```
 
 ## 输出格式
 

@@ -10,7 +10,7 @@ private enum CommandLineError: Error, LocalizedError {
         case .missingConfigPath:
             return "--config requires a file path"
         case .conflictingCommands:
-            return "Use only one of --configure or --validate-config"
+            return "Use only one of --configure, --validate-config, or --sync-history"
         }
     }
 }
@@ -48,9 +48,10 @@ private func validate(_ configURL: URL) throws -> ReaderConfiguration {
 let arguments = Array(CommandLine.arguments.dropFirst())
 let shouldConfigure = arguments.contains("--configure")
 let shouldValidate = arguments.contains("--validate-config")
+let shouldSyncHistory = arguments.contains("--sync-history")
 
 do {
-    guard !(shouldConfigure && shouldValidate) else {
+    guard [shouldConfigure, shouldValidate, shouldSyncHistory].filter({ $0 }).count <= 1 else {
         throw CommandLineError.conflictingCommands
     }
     let configURL = try configurationURL(arguments: arguments)
@@ -71,7 +72,11 @@ do {
         fileURL: configuration.logFileURL,
         debugEnabled: configuration.debugLogging
     )
-    let reader = BluetoothReader(configuration: configuration, logger: logger)
+    let reader = BluetoothReader(
+        configuration: configuration,
+        logger: logger,
+        sessionMode: shouldSyncHistory ? .history : .live
+    )
     reader.start()
     withExtendedLifetime(reader) {
         RunLoop.main.run()

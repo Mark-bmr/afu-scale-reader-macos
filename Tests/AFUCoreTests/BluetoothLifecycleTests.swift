@@ -64,4 +64,38 @@ final class BluetoothLifecycleTests: XCTestCase {
         XCTAssertTrue(lifecycle.shouldScan)
         XCTAssertFalse(lifecycle.hasActiveConnection)
     }
+
+    func testCompletedSessionWaitsForFreshAdvertisementBurst() {
+        var lifecycle = BluetoothLifecycle(isBluetoothAvailable: true)
+        lifecycle.connectionStarted()
+
+        lifecycle.connectionEnded(waitForFreshAdvertisement: true)
+
+        XCTAssertTrue(lifecycle.shouldScan)
+        XCTAssertFalse(lifecycle.shouldConnectToAdvertisement)
+
+        lifecycle.advertisementQuietPeriodElapsed()
+
+        XCTAssertTrue(lifecycle.shouldConnectToAdvertisement)
+    }
+
+    func testInterruptedFinalResultCanReconnectImmediately() {
+        var lifecycle = BluetoothLifecycle(isBluetoothAvailable: true)
+        lifecycle.connectionStarted()
+
+        lifecycle.connectionEnded(waitForFreshAdvertisement: false)
+
+        XCTAssertTrue(lifecycle.shouldConnectToAdvertisement)
+    }
+
+    func testBluetoothUnavailableClearsAdvertisementGate() {
+        var lifecycle = BluetoothLifecycle(isBluetoothAvailable: true)
+        lifecycle.connectionStarted()
+        lifecycle.connectionEnded(waitForFreshAdvertisement: true)
+
+        lifecycle.bluetoothAvailabilityChanged(to: false)
+        lifecycle.bluetoothAvailabilityChanged(to: true)
+
+        XCTAssertTrue(lifecycle.shouldConnectToAdvertisement)
+    }
 }

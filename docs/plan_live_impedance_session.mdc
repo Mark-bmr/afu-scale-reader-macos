@@ -1,0 +1,220 @@
+# 实时抗阻会话分流 实现计划
+
+> **目标**：默认称重时只发送启用抗阻所需的 D0 用户会话配置，并把历史同步握手与实时测量状态隔离，避免同一次唤醒反复连接。
+> **架构**：在现有 `AFUSessionInitializationPackets` 中显式区分实时与历史模式，不新增协议层或第三方依赖。沿用 `BluetoothLifecycle` 管理连接门控：D5 后的短暂断连允许立即重连等待 D6，完整结果后的断连则等待一段无匹配广播的静默期，再把下一次广播视为新一轮唤醒。
+> **技术栈**：Swift、CoreBluetooth、Swift Package Manager、XCTest
+
+---
+
+## 改动范围
+
+| 文件 | 改动类型 | 改动说明 | 影响面 |
+|------|----------|----------|--------|
+| `Sources/AFUCore/AFUSessionProfile.swift` | 修改 | 新增 `AFUSessionMode`；实时模式生成单个 D0，历史模式保留 D1/D0/D1/D0 | 初始化包调用方必须显式传入模式，编译期阻止误用 |
+| `Tests/AFUCoreTests/AFUSessionProfileTests.swift` | 修改 | 分别锁定实时与历史模式的指令序列 | 只影响测试 |
+| `Sources/AFUCore/BluetoothLifecycle.swift` | 修改 | 在现有生命周期结构中加入广播静默门控 | 扫描仍可继续，只有连接动作受门控 |
+| `Tests/AFUCoreTests/BluetoothLifecycleTests.swift` | 修改 | 覆盖正常会话后的门控、D5 等待 D6 时的直连以及蓝牙恢复 | 只影响测试 |
+| `Sources/AFUCore/ReaderConfiguration.swift` | 修改 | 新增 `advertisement_quiet_seconds`，默认 5 秒并复用现有正数校验 | 配置文件不写该字段时行为向后兼容 |
+| `Tests/AFUCoreTests/ReaderConfigurationTests.swift` | 修改 | 覆盖默认值、显式值和非正数错误 | 只影响测试 |
+| `Sources/AFUReader/BluetoothReader.swift` | 修改 | 按模式发送初始化包；实时模式优先无响应写入；D6 与 D8 使用独立会话跟踪器；完整实时结果后主动断连；按生命周期门控下一次连接 | 改变 BLE 会话时序，不改变持久化格式 |
+| `Sources/AFUReader/main.swift` | 修改 | 默认使用实时模式，增加显式 `--sync-history` 历史同步入口 | LaunchAgent 未传参数时继续运行实时模式 |
+| `config.example.json` | 修改 | 公开广播静默期配置示例 | 只影响示例配置 |
+| `README.md` | 修改 | 说明默认实时抗阻流程和手动历史同步命令 | 只影响文档 |
+
+不新增模块、协议接口、第三方包或后台进程。现有 `MeasurementSessionTracker`、`BluetoothLifecycle` 和写入链路直接复用。
+
+## 数据链路
+
+### 默认实时模式
+
+```text
+匹配名称与厂商数据的 BLE 广播
+→ BluetoothLifecycle.shouldConnectToAdvertisement
+→ CoreBluetooth 连接并订阅 FFB2
+→ AFUSessionInitializationPackets.encode(mode: .live, ...)
+→ 单个 20 字节 D0（功能位 0x03）写入 FFB1
+→ D5 暂存体重候选
+→ 若短暂断连则保留候选并立即允许重连
+→ D6 解析抗阻并与 D5 合并
+→ BodyCompositionCalculator 计算
+→ MeasurementStore 去重并写入 Markdown/JSON
+→ 主动断连并等待 advertisement_quiet_seconds 无匹配广播
+→ 下一次匹配广播才开始新会话
+```
+
+### 显式历史模式
+
+```text
+AFUReader --sync-history
+→ AFUSessionMode.history
+→ 订阅 FFB2
+→ D1/D0/D1/D0 写入 FFB1
+→ D8 由独立 historyTracker 解析
+→ MeasurementStore 使用既有去重规则写入
+```
+
+### 错误路径
+
+```text
+配置字段缺失或非正数
+→ ReaderConfigurationError.invalidInterval
+→ main 输出可读错误并以非零状态结束
+
+BLE 写入、订阅或连接失败
+→ BluetoothReader 记录不含个人测量值的错误
+→ 清理连接状态
+→ 未收到 D5 时进入广播静默门控；已收到 D5 时按既有逻辑重连等待 D6
+```
+
+## Task 1: 分离实时与历史会话初始化
+
+**文件**：修改 `Tests/AFUCoreTests/AFUSessionProfileTests.swift`、`Sources/AFUCore/AFUSessionProfile.swift`、`Sources/AFUReader/BluetoothReader.swift`、`Sources/AFUReader/main.swift`、`README.md`
+
+1. 编写失败测试
+
+   ```swift
+   func testBuildsSingleLiveProfilePacket() throws {
+       let packets = try AFUSessionInitializationPackets.encode(
+           mode: .live,
+           deviceType: 0x27,
+           profile: syntheticProfile,
+           at: syntheticDate,
+           timeZone: syntheticTimeZone
+       )
+       XCTAssertEqual(packets.map { $0[18] }, [0xD0])
+   }
+
+   func testBuildsTwoHistoryInitializationRounds() throws {
+       let packets = try AFUSessionInitializationPackets.encode(
+           mode: .history,
+           deviceType: 0x27,
+           profile: syntheticProfile,
+           at: syntheticDate,
+           timeZone: syntheticTimeZone
+       )
+       XCTAssertEqual(packets.map { $0[18] }, [0xD1, 0xD0, 0xD1, 0xD0])
+   }
+   ```
+
+2. 运行测试，确认失败
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache swift test --disable-sandbox --scratch-path /tmp/afu-scale-live-session-build --filter AFUSessionProfileTests
+   # 预期输出：FAIL，AFUSessionMode 与 mode 参数尚不存在
+   ```
+
+3. 编写最小实现，使测试通过
+
+   ```swift
+   public enum AFUSessionMode: Equatable, Sendable {
+       case live
+       case history
+   }
+
+   return mode == .live
+       ? [profilePacket]
+       : [userPacket, profilePacket, userPacket, profilePacket]
+   ```
+
+   `BluetoothReader` 接收一个不可变的 `sessionMode`。实时模式优先使用 FFB1 的 `.withoutResponse`，硬件不支持时回退 `.withResponse`；历史模式保留当前逐包 `.withResponse` 写入。D6 继续进入现有实时 `MeasurementSessionTracker`，D8 改由同配置的独立 `historyTracker` 处理。`main.swift` 无参数时传入 `.live`，仅在命令行包含 `--sync-history` 时传入 `.history`。
+
+4. 运行测试，确认通过
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache swift test --disable-sandbox --scratch-path /tmp/afu-scale-live-session-build --filter AFUSessionProfileTests
+   # 预期输出：PASS
+   ```
+
+5. 提交
+
+   ```bash
+   git add Sources/AFUCore/AFUSessionProfile.swift Tests/AFUCoreTests/AFUSessionProfileTests.swift Sources/AFUReader/BluetoothReader.swift Sources/AFUReader/main.swift README.md
+   git commit -m "fix: separate live and history scale sessions"
+   ```
+
+## Task 2: 用广播静默期识别下一次称重唤醒
+
+**文件**：修改 `Tests/AFUCoreTests/BluetoothLifecycleTests.swift`、`Tests/AFUCoreTests/ReaderConfigurationTests.swift`、`Sources/AFUCore/BluetoothLifecycle.swift`、`Sources/AFUCore/ReaderConfiguration.swift`、`Sources/AFUReader/BluetoothReader.swift`、`config.example.json`
+
+1. 编写失败测试
+
+   ```swift
+   func testCompletedSessionWaitsForFreshAdvertisementBurst() {
+       var lifecycle = BluetoothLifecycle(isBluetoothAvailable: true)
+       lifecycle.connectionStarted()
+       lifecycle.connectionEnded(waitForFreshAdvertisement: true)
+       XCTAssertFalse(lifecycle.shouldConnectToAdvertisement)
+       lifecycle.advertisementQuietPeriodElapsed()
+       XCTAssertTrue(lifecycle.shouldConnectToAdvertisement)
+   }
+
+   func testInterruptedFinalResultCanReconnectImmediately() {
+       var lifecycle = BluetoothLifecycle(isBluetoothAvailable: true)
+       lifecycle.connectionStarted()
+       lifecycle.connectionEnded(waitForFreshAdvertisement: false)
+       XCTAssertTrue(lifecycle.shouldConnectToAdvertisement)
+   }
+   ```
+
+   配置测试同时断言缺省 `advertisementQuietInterval == 5`、显式 `advertisement_quiet_seconds` 可覆盖，以及值为 0 时返回 `.invalidInterval(field: "advertisement_quiet_seconds", value: 0)`。
+
+2. 运行测试，确认失败
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache swift test --disable-sandbox --scratch-path /tmp/afu-scale-live-session-build --filter 'BluetoothLifecycleTests|ReaderConfigurationTests'
+   # 预期输出：FAIL，新生命周期 API 与配置字段尚不存在
+   ```
+
+3. 编写最小实现，使测试通过
+
+   ```swift
+   public var shouldConnectToAdvertisement: Bool {
+       shouldScan && !requiresAdvertisementQuietPeriod
+   }
+
+   public mutating func connectionEnded(waitForFreshAdvertisement: Bool = false) {
+       hasActiveConnection = false
+       requiresAdvertisementQuietPeriod = waitForFreshAdvertisement
+   }
+
+   public mutating func advertisementQuietPeriodElapsed() {
+       requiresAdvertisementQuietPeriod = false
+   }
+   ```
+
+   `BluetoothReader` 在门控期间仍扫描；每次看到匹配广播就把一次性静默计时器重置为配置秒数，计时器到期后调用 `advertisementQuietPeriodElapsed()`。D5 候选等待 D6 时断连传 `false`，其余已建立会话的断连传 `true`。实时 D6 成功处理后主动取消连接，使旧广播不能触发初始化风暴。
+
+4. 运行测试，确认通过
+
+   ```bash
+   CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache swift test --disable-sandbox --scratch-path /tmp/afu-scale-live-session-build --filter 'BluetoothLifecycleTests|ReaderConfigurationTests'
+   # 预期输出：PASS
+   ```
+
+5. 提交
+
+   ```bash
+   git add Sources/AFUCore/BluetoothLifecycle.swift Tests/AFUCoreTests/BluetoothLifecycleTests.swift Sources/AFUCore/ReaderConfiguration.swift Tests/AFUCoreTests/ReaderConfigurationTests.swift Sources/AFUReader/BluetoothReader.swift config.example.json
+   git commit -m "fix: gate reconnects between scale wake cycles"
+   ```
+
+## 测试策略
+
+- 单元测试锁定实时与历史模式的 BLE 指令顺序，防止历史握手再次成为默认行为。
+- 单元测试锁定广播静默门控，尤其保留 D5 后等待 D6 的立即重连路径。
+- 配置测试锁定默认值、显式覆盖与非法值错误。
+- 全量 XCTest 与 Release 构建验证其他解析、去重、持久化及命令行代码未回归。
+- 仓库隐私脚本验证测试和文档只含合成数据。
+- 实机验收在代码验证完成后由用户显式启动读取器：一次称重必须出现 D5 后 D6，Markdown/JSON 只新增一条，秤保持同一唤醒广播时不得重复连接；未执行实机验收前不声称硬件问题已闭环。
+
+## 验证方式
+
+```bash
+CLANG_MODULE_CACHE_PATH=/tmp/afu-scale-clang-cache SWIFTPM_MODULECACHE_OVERRIDE=/tmp/afu-scale-swiftpm-cache swift test --disable-sandbox --scratch-path /tmp/afu-scale-live-session-build
+swift build -c release --disable-sandbox --scratch-path /tmp/afu-scale-live-session-release
+bash scripts/check-public-repo.sh
+git diff --check
+git status --short
+```
+
+完成标准：以上命令全部成功；默认入口选择 `.live`，历史入口仅由 `--sync-history` 选择；代码与日志不新增体重、抗阻、生日、设备标识或原始 BLE 帧输出；LaunchAgent 和后台读取器在开发验证期间保持停止。

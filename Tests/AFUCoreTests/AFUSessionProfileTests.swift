@@ -79,8 +79,22 @@ final class AFUSessionProfileTests: XCTestCase {
         ]))
     }
 
-    func testBuildsTwoVendorInitializationRounds() throws {
+    func testBuildsSingleLiveProfilePacket() throws {
         let packets = try AFUSessionInitializationPackets.encode(
+            mode: .live,
+            deviceType: 0x27,
+            profile: profile(sex: .male, height: 170, birthDate: date("1990-01-01T00:00:00Z")),
+            currentWeightKilograms: 70,
+            at: Date(timeIntervalSince1970: 1_600_000_000),
+            timeZone: try XCTUnwrap(TimeZone(secondsFromGMT: 8 * 3_600))
+        )
+
+        XCTAssertEqual(packets.map { $0[18] }, [0xD0])
+    }
+
+    func testBuildsTwoHistoryInitializationRounds() throws {
+        let packets = try AFUSessionInitializationPackets.encode(
+            mode: .history,
             deviceType: 0x27,
             profile: profile(sex: .male, height: 170, birthDate: date("1990-01-01T00:00:00Z")),
             currentWeightKilograms: 70,
@@ -137,6 +151,7 @@ final class AFUSessionProfileTests: XCTestCase {
         }
 
         XCTAssertThrowsError(try AFUSessionInitializationPackets.encode(
+            mode: .live,
             deviceType: 0x27,
             profile: profile(sex: .male, height: 170, birthDate: date("1990-01-01T00:00:00Z")),
             currentWeightKilograms: -1,
@@ -147,6 +162,7 @@ final class AFUSessionProfileTests: XCTestCase {
         }
 
         XCTAssertThrowsError(try AFUSessionInitializationPackets.encode(
+            mode: .live,
             deviceType: 0x27,
             profile: profile(sex: .male, height: 170, birthDate: date("1990-01-01T00:00:00Z")),
             currentWeightKilograms: .nan,

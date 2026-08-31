@@ -12,5 +12,6 @@
   "settle_seconds": 2,
   "deduplication_seconds": 120,
   "connection_timeout_seconds": 8,
-  "retry_delay_seconds": 1
+  "retry_delay_seconds": 1,
+  "advertisement_quiet_seconds": 5
 }
