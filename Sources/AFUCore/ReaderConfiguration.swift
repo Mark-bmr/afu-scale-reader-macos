@@ -83,8 +83,6 @@ extension ReaderConfigurationError: LocalizedError {
 }
 
 public struct ReaderConfiguration: Equatable, Sendable {
-    public static let minimumAdvertisementQuietInterval: TimeInterval = 45
-
     public let deviceNamePrefix: String
     public let outputFileURL: URL
     public let outputFormat: OutputFormat
@@ -111,7 +109,7 @@ public struct ReaderConfiguration: Equatable, Sendable {
         deduplicationWindow: TimeInterval = 120,
         connectionTimeout: TimeInterval = 8,
         retryDelay: TimeInterval = 1,
-        advertisementQuietInterval: TimeInterval = ReaderConfiguration.minimumAdvertisementQuietInterval
+        advertisementQuietInterval: TimeInterval = 5
     ) {
         self.deviceNamePrefix = deviceNamePrefix
         self.outputFileURL = outputFileURL
@@ -126,10 +124,7 @@ public struct ReaderConfiguration: Equatable, Sendable {
         self.deduplicationWindow = deduplicationWindow
         self.connectionTimeout = connectionTimeout
         self.retryDelay = retryDelay
-        self.advertisementQuietInterval = max(
-            advertisementQuietInterval,
-            Self.minimumAdvertisementQuietInterval
-        )
+        self.advertisementQuietInterval = advertisementQuietInterval
     }
 
     public static func load(
@@ -221,8 +216,7 @@ public struct ReaderConfiguration: Equatable, Sendable {
         let deduplicationWindow = raw.deduplicationSeconds ?? 120
         let connectionTimeout = raw.connectionTimeoutSeconds ?? 8
         let retryDelay = raw.retryDelaySeconds ?? 1
-        let advertisementQuietInterval = raw.advertisementQuietSeconds
-            ?? Self.minimumAdvertisementQuietInterval
+        let advertisementQuietInterval = raw.advertisementQuietSeconds ?? 5
         try validateInterval(settleInterval, field: "settle_seconds")
         try validateInterval(deduplicationWindow, field: "deduplication_seconds")
         try validateInterval(connectionTimeout, field: "connection_timeout_seconds")

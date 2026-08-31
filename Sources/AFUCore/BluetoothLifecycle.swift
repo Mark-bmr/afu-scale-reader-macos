@@ -1,8 +1,10 @@
+import Foundation
+
 public struct BluetoothLifecycle: Equatable, Sendable {
     public private(set) var isBluetoothAvailable: Bool
     public private(set) var hasActiveConnection: Bool
     private var needsCentralRecreation = false
-    private var requiresAdvertisementQuietPeriod = false
+    private var reconnectAllowedAt: Date?
 
     public init(
         isBluetoothAvailable: Bool = false,
@@ -16,8 +18,8 @@ public struct BluetoothLifecycle: Equatable, Sendable {
         isBluetoothAvailable && !hasActiveConnection
     }
 
-    public var shouldConnectToAdvertisement: Bool {
-        shouldScan && !requiresAdvertisementQuietPeriod
+    public func shouldConnectToAdvertisement(at date: Date) -> Bool {
+        shouldScan && (reconnectAllowedAt.map { date >= $0 } ?? true)
     }
 
     public mutating func bluetoothAvailabilityChanged(to isAvailable: Bool) {
@@ -25,7 +27,7 @@ public struct BluetoothLifecycle: Equatable, Sendable {
         isBluetoothAvailable = isAvailable
         if !isAvailable {
             hasActiveConnection = false
-            requiresAdvertisementQuietPeriod = false
+            reconnectAllowedAt = nil
             if wasAvailable {
                 needsCentralRecreation = true
             }
@@ -41,15 +43,11 @@ public struct BluetoothLifecycle: Equatable, Sendable {
     public mutating func connectionStarted() {
         guard isBluetoothAvailable else { return }
         hasActiveConnection = true
-        requiresAdvertisementQuietPeriod = false
+        reconnectAllowedAt = nil
     }
 
-    public mutating func connectionEnded(waitForFreshAdvertisement: Bool = false) {
+    public mutating func connectionEnded(reconnectAt: Date? = nil) {
         hasActiveConnection = false
-        requiresAdvertisementQuietPeriod = waitForFreshAdvertisement
-    }
-
-    public mutating func advertisementQuietPeriodElapsed() {
-        requiresAdvertisementQuietPeriod = false
+        reconnectAllowedAt = reconnectAt
     }
 }

@@ -26,7 +26,6 @@ final class BluetoothReader: NSObject {
     private var previousHistoryMeasuredAt: Date?
     private var setupTimeoutTimer: Timer?
     private var retryTimer: Timer?
-    private var advertisementQuietTimer: Timer?
     private var flushTimer: Timer?
     private var interruptedSessionTimer: Timer?
     private var persistenceRetryTimer: Timer?
@@ -63,7 +62,6 @@ final class BluetoothReader: NSObject {
         shouldRun = false
         setupTimeoutTimer?.invalidate()
         retryTimer?.invalidate()
-        advertisementQuietTimer?.invalidate()
         flushTimer?.invalidate()
         interruptedSessionTimer?.invalidate()
         persistenceRetryTimer?.invalidate()
@@ -135,8 +133,6 @@ final class BluetoothReader: NSObject {
         activePeripheral = peripheral
         activeProtocolMetadata = protocolMetadata
         lifecycle.connectionStarted()
-        advertisementQuietTimer?.invalidate()
-        advertisementQuietTimer = nil
         writeCharacteristic = nil
         notifyCharacteristic = nil
         sessionInitializationAttempted = false
@@ -183,25 +179,6 @@ final class BluetoothReader: NSObject {
     }
 
     @objc private func retryTimerFired(_: Timer) {
-        startScan()
-    }
-
-    private func restartAdvertisementQuietTimer() {
-        guard shouldRun else { return }
-        advertisementQuietTimer?.invalidate()
-        advertisementQuietTimer = Timer.scheduledTimer(
-            timeInterval: configuration.advertisementQuietInterval,
-            target: self,
-            selector: #selector(advertisementQuietTimerFired(_:)),
-            userInfo: nil,
-            repeats: false
-        )
-    }
-
-    @objc private func advertisementQuietTimerFired(_: Timer) {
-        advertisementQuietTimer = nil
-        lifecycle.advertisementQuietPeriodElapsed()
-        log("Scale advertisement burst ended; waiting for the next wake")
         startScan()
     }
 
@@ -504,7 +481,7 @@ final class BluetoothReader: NSObject {
         }
     }
 
-    private func resetConnectionState(waitForFreshAdvertisement: Bool = false) {
+    private func resetConnectionState(reconnectAt: Date? = nil) {
         setupTimeoutTimer?.invalidate()
         setupTimeoutTimer = nil
         writeCharacteristic = nil
@@ -516,14 +493,12 @@ final class BluetoothReader: NSObject {
         activePeripheral = nil
         activeProtocolMetadata = nil
         sessionInitializationAttempted = false
-        lifecycle.connectionEnded(waitForFreshAdvertisement: waitForFreshAdvertisement)
+        lifecycle.connectionEnded(reconnectAt: reconnectAt)
     }
 
     private func prepareForUnavailableBluetooth() {
         let hadActivePeripheral = activePeripheral != nil
         retryTimer?.invalidate()
-        advertisementQuietTimer?.invalidate()
-        advertisementQuietTimer = nil
         flushTimer?.invalidate()
         cancelInterruptedSessionFlush()
         central?.stopScan()
@@ -594,12 +569,7 @@ extension BluetoothReader: @preconcurrency CBCentralManagerDelegate {
         guard matchesScale(peripheral: peripheral, advertisementData: advertisementData) else {
             return
         }
-        guard lifecycle.shouldConnectToAdvertisement else {
-            if lifecycle.shouldScan {
-                restartAdvertisementQuietTimer()
-            }
-            return
-        }
+        guard lifecycle.shouldConnectToAdvertisement(at: Date()) else { return }
         let advertisedName = advertisementData[CBAdvertisementDataLocalNameKey] as? String
         let name = peripheral.name ?? advertisedName ?? "AFU scale"
         let metadata = protocolMetadata(from: advertisementData)
@@ -634,7 +604,8 @@ extension BluetoothReader: @preconcurrency CBCentralManagerDelegate {
         error: Error?
     ) {
         guard activePeripheral?.identifier == peripheral.identifier else { return }
-        if let measurement = sessionTracker.connectionInterrupted(at: Date()) {
+        let disconnectedAt = Date()
+        if let measurement = sessionTracker.connectionInterrupted(at: disconnectedAt) {
             enqueueForPersistence(measurement)
         }
         if sessionTracker.isAwaitingFinalResult {
@@ -644,12 +615,10 @@ extension BluetoothReader: @preconcurrency CBCentralManagerDelegate {
         }
         flushTimer?.invalidate()
         log("Disconnected: \(error?.localizedDescription ?? "scale is idle")")
-        let waitForFreshAdvertisement = sessionInitializationAttempted
-            && !sessionTracker.isAwaitingFinalResult
-        resetConnectionState(waitForFreshAdvertisement: waitForFreshAdvertisement)
-        if waitForFreshAdvertisement {
-            restartAdvertisementQuietTimer()
-        }
+        let reconnectAt = sessionInitializationAttempted && !sessionTracker.isAwaitingFinalResult
+            ? disconnectedAt.addingTimeInterval(configuration.advertisementQuietInterval)
+            : nil
+        resetConnectionState(reconnectAt: reconnectAt)
         scheduleScanRetry()
     }
 }

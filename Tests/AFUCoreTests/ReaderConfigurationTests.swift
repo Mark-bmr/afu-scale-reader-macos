@@ -81,7 +81,7 @@ final class ReaderConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.deduplicationWindow, 120)
         XCTAssertEqual(configuration.connectionTimeout, 8)
         XCTAssertEqual(configuration.retryDelay, 1)
-        XCTAssertEqual(configuration.advertisementQuietInterval, 45)
+        XCTAssertEqual(configuration.advertisementQuietInterval, 5)
         XCTAssertEqual(permissions(of: url), 0o600)
     }
 
@@ -146,7 +146,7 @@ final class ReaderConfigurationTests: XCTestCase {
           "deduplication_seconds": 180,
           "connection_timeout_seconds": 12,
           "retry_delay_seconds": 2,
-          "advertisement_quiet_seconds": 60
+          "advertisement_quiet_seconds": 7
         }
         """)
 
@@ -157,26 +157,7 @@ final class ReaderConfigurationTests: XCTestCase {
         XCTAssertEqual(configuration.deduplicationWindow, 180)
         XCTAssertEqual(configuration.connectionTimeout, 12)
         XCTAssertEqual(configuration.retryDelay, 2)
-        XCTAssertEqual(configuration.advertisementQuietInterval, 60)
-    }
-
-    func testNormalizesLegacyShortAdvertisementQuietInterval() throws {
-        let url = try writeConfiguration("""
-        {
-          "output_path": "/tmp/afu.md",
-          "output_format": "md",
-          "store_id": "\(storeID.uuidString)",
-          "debug_logging": false,
-          "sex": "male",
-          "height_cm": 175,
-          "birth_date": "1990-01-01",
-          "advertisement_quiet_seconds": 5
-        }
-        """)
-
-        let configuration = try ReaderConfiguration.load(from: url)
-
-        XCTAssertEqual(configuration.advertisementQuietInterval, 45)
+        XCTAssertEqual(configuration.advertisementQuietInterval, 7)
     }
 
     func testRejectsUnknownSex() throws {

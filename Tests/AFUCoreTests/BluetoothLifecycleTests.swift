@@ -1,3 +1,4 @@
+import Foundation
 import XCTest
 @testable import AFUCore
 
@@ -65,37 +66,57 @@ final class BluetoothLifecycleTests: XCTestCase {
         XCTAssertFalse(lifecycle.hasActiveConnection)
     }
 
-    func testCompletedSessionWaitsForFreshAdvertisementBurst() {
+    func testCompletedSessionWaitsForReconnectCooldown() {
+        let disconnectedAt = Date(timeIntervalSince1970: 1_000)
+        let reconnectAt = disconnectedAt.addingTimeInterval(5)
         var lifecycle = BluetoothLifecycle(isBluetoothAvailable: true)
         lifecycle.connectionStarted()
 
-        lifecycle.connectionEnded(waitForFreshAdvertisement: true)
+        lifecycle.connectionEnded(reconnectAt: reconnectAt)
 
         XCTAssertTrue(lifecycle.shouldScan)
-        XCTAssertFalse(lifecycle.shouldConnectToAdvertisement)
+        XCTAssertFalse(lifecycle.shouldConnectToAdvertisement(at: disconnectedAt))
+        XCTAssertFalse(lifecycle.shouldConnectToAdvertisement(
+            at: reconnectAt.addingTimeInterval(-0.001)
+        ))
+        XCTAssertTrue(lifecycle.shouldConnectToAdvertisement(at: reconnectAt))
+    }
 
-        lifecycle.advertisementQuietPeriodElapsed()
+    func testRepeatedAdvertisementsDoNotExtendReconnectCooldown() {
+        let disconnectedAt = Date(timeIntervalSince1970: 1_000)
+        let reconnectAt = disconnectedAt.addingTimeInterval(5)
+        var lifecycle = BluetoothLifecycle(isBluetoothAvailable: true)
+        lifecycle.connectionStarted()
+        lifecycle.connectionEnded(reconnectAt: reconnectAt)
 
-        XCTAssertTrue(lifecycle.shouldConnectToAdvertisement)
+        XCTAssertFalse(lifecycle.shouldConnectToAdvertisement(
+            at: disconnectedAt.addingTimeInterval(1)
+        ))
+        XCTAssertFalse(lifecycle.shouldConnectToAdvertisement(
+            at: disconnectedAt.addingTimeInterval(4.9)
+        ))
+        XCTAssertTrue(lifecycle.shouldConnectToAdvertisement(at: reconnectAt))
     }
 
     func testInterruptedFinalResultCanReconnectImmediately() {
+        let now = Date(timeIntervalSince1970: 1_000)
         var lifecycle = BluetoothLifecycle(isBluetoothAvailable: true)
         lifecycle.connectionStarted()
 
-        lifecycle.connectionEnded(waitForFreshAdvertisement: false)
+        lifecycle.connectionEnded()
 
-        XCTAssertTrue(lifecycle.shouldConnectToAdvertisement)
+        XCTAssertTrue(lifecycle.shouldConnectToAdvertisement(at: now))
     }
 
-    func testBluetoothUnavailableClearsAdvertisementGate() {
+    func testBluetoothUnavailableClearsReconnectCooldown() {
+        let now = Date(timeIntervalSince1970: 1_000)
         var lifecycle = BluetoothLifecycle(isBluetoothAvailable: true)
         lifecycle.connectionStarted()
-        lifecycle.connectionEnded(waitForFreshAdvertisement: true)
+        lifecycle.connectionEnded(reconnectAt: now.addingTimeInterval(5))
 
         lifecycle.bluetoothAvailabilityChanged(to: false)
         lifecycle.bluetoothAvailabilityChanged(to: true)
 
-        XCTAssertTrue(lifecycle.shouldConnectToAdvertisement)
+        XCTAssertTrue(lifecycle.shouldConnectToAdvertisement(at: now))
     }
 }
