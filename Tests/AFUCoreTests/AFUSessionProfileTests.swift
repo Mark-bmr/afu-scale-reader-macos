@@ -107,6 +107,11 @@ final class AFUSessionProfileTests: XCTestCase {
         XCTAssertEqual(packets[1], packets[3])
     }
 
+    func testOnlyHistoryModePersistsHistoricalMeasurements() {
+        XCTAssertFalse(AFUSessionMode.live.persistsHistoricalMeasurements)
+        XCTAssertTrue(AFUSessionMode.history.persistsHistoricalMeasurements)
+    }
+
     func testEncodesNegativeTimezoneUsingTwosComplement() throws {
         let packet = try AFUSessionProfilePacket.encode(
             deviceType: 0x27,

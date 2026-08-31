@@ -84,6 +84,10 @@ public enum AFUSessionDeviceType {
 public enum AFUSessionMode: Equatable, Sendable {
     case live
     case history
+
+    public var persistsHistoricalMeasurements: Bool {
+        self == .history
+    }
 }
 
 public enum AFUSessionProfilePacket {
